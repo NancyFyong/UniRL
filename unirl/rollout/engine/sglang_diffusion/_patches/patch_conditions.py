@@ -78,6 +78,21 @@ logger = logging.getLogger(__name__)
 # The 6 conditions fields, in the fork's order. All default to None and are
 # typed ``list[torch.Tensor] | None`` (one entry per text encoder) on
 # OutputBatch; ``Any``-typed on GenerationResult to match its existing style.
+#
+# ``image_latent`` (7th field, Edit-Plus only) is a single packed
+# ``[B, S_img, C*4]`` tensor — NOT a per-encoder list. It is wrapped as a
+# one-element list ``[tensor]`` at copy time so it flows through the existing
+# list-based merge/slice path unchanged (one "encoder", one tensor). Only
+# Edit-Plus sets ``batch.image_latent`` (via upstream's
+# ``ImageVAEEncodingStage``); T2I models leave it ``None``, so this field is
+# a no-op for every non-Edit-Plus adapter.
+#
+# ``image_latent_sizes`` (8th field, Edit-Plus only) carries the per-request
+# ``vae_image_sizes`` (a ``list[tuple[int, int]]`` of pixel (W, H) pairs from
+# upstream's ``preprocess_vae_image``). The adapter needs these to unpack
+# ``image_latent`` from packed ``[S_img, C*4]`` to spatial ``[C, H_img, W_img]``
+# (S_img alone is ambiguous — multiple H×W grids give the same token count).
+# Wrapped as ``[value]`` to fit the list-based merge/slice path.
 _COND_FIELDS = (
     "prompt_embeds",
     "pooled_prompt_embeds",
@@ -85,6 +100,8 @@ _COND_FIELDS = (
     "negative_prompt_embeds",
     "neg_pooled_prompt_embeds",
     "negative_attention_mask",
+    "image_latent",
+    "image_latent_sizes",
 )
 
 # result(Req) source attr -> OutputBatch dest attr (the fork's gpu_worker mapping).
@@ -289,6 +306,25 @@ def _copy_conditions(src, output_batch) -> None:
         _copy_mapped_conditions(src, output_batch, _POS_MAP)
     if getattr(src, "return_negative_prompt_embeds", False):
         _copy_mapped_conditions(src, output_batch, _NEG_MAP)
+    # Edit-Plus image_latent: a single packed [B, S_img, C*4] tensor set by
+    # upstream's ImageVAEEncodingStage. Not gated on a SamplingParams flag —
+    # presence on the batch IS the gate (only Edit-Plus sets it; T2I leaves
+    # it None). Wrapped as [tensor] to fit the list-based merge/slice path.
+    image_latent = getattr(src, "image_latent", None)
+    if image_latent is not None:
+        import torch
+
+        if torch.is_tensor(image_latent):
+            output_batch.image_latent = [image_latent.detach().cpu()]
+        elif isinstance(image_latent, (list, tuple)):
+            moved = [t.detach().cpu() if torch.is_tensor(t) else t for t in image_latent]
+            output_batch.image_latent = moved if isinstance(image_latent, list) else list(moved)
+    # Edit-Plus vae_image_sizes: list[tuple[int, int]] of pixel (W, H) pairs
+    # from upstream's preprocess_vae_image. The adapter needs these to unpack
+    # image_latent to spatial form. Wrapped as [value] for the merge/slice path.
+    vae_image_sizes = getattr(src, "vae_image_sizes", None)
+    if vae_image_sizes is not None:
+        output_batch.image_latent_sizes = [vae_image_sizes]
 
 
 def _copy_mapped_conditions(src, output_batch, mapping) -> None:
@@ -433,6 +469,10 @@ def _merge_conditions(merged, output_batches) -> None:
             tensors = [v[enc_idx] for v in per_batch]
             if any(t is None for t in tensors):
                 merged_list.append(None)
+            elif name == "image_latent_sizes":
+                # Non-tensor (list[tuple[int,int]]); all outputs in a group
+                # share the same source image, so take the first.
+                merged_list.append(tensors[0])
             else:
                 merged_list.append(torch.cat(tensors, dim=0))
         setattr(merged, name, merged_list)
