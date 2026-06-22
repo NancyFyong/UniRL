@@ -115,6 +115,12 @@ index-strategy = "unsafe-best-match"
 override-dependencies = [
   "kernels>=0.12,<0.13",
   "tokenizers>=0.22,<0.23",
+  # sglang[diffusion]==0.5.12.post1 pins diffusers==0.37.0 exactly, but the
+  # core extra requires >=0.38.0 (LTX-2: transformer.forward gained
+  # sigma/audio_sigma/isolate_modalities/use_cross_timestep, connector gained
+  # padding_side, calculate_shift pins image_seq_len to max_image_seq_len).
+  # Verified that 0.38 keeps every API sglang's diffusion rollout touches.
+  "diffusers>=0.38.0",
 ]
 environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
