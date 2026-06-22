@@ -205,7 +205,9 @@ sync:
   # match the engine-side LoRA key naming (a wrong prefix yields wrong/zero
   # loaded layers, which `verify` catches).
   param_prefix: "transformer."
-  adapter_name: default
+  # adapter_name intentionally omitted — defers to backend.rollout_adapter_name
+  # = "old" (the DiffusionNFT EMA shadow). An explicit "default" would push the
+  # trainable adapter instead, degenerating the off-policy ratio to ~1.0.
 
 logging:
   report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}

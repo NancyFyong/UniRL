@@ -65,6 +65,15 @@ model_config:
     - attn.to_out.0
     - attn.to_q
     - attn.to_v
+    # Match the 4 img/txt MLP projections in backend.ema_lora_cfg.target_modules
+    # (the v1 DiffusionNFT set). SGLang's is_target_layer uses substring match,
+    # so the bare names hit transformer_blocks.N.{img,txt}_mlp.net.* in every
+    # block. Omitting these silently drops 4 LoRA deltas the trainer optimizes
+    # → trajectory divergence vs trainsite.
+    - img_mlp.net.0.proj
+    - img_mlp.net.2
+    - txt_mlp.net.0.proj
+    - txt_mlp.net.2
 
 # Shared SDE strategy; the adapter resolves its sde_label from it.
 # DiffusionNFT: forward-process (num_sde_steps=0) → the engine takes the ODE
@@ -175,6 +184,11 @@ rollout:
       - attn.to_out.0
       - attn.to_q
       - attn.to_v
+      # Match ema_lora_cfg.target_modules (12-module DiffusionNFT set).
+      - img_mlp.net.0.proj
+      - img_mlp.net.2
+      - txt_mlp.net.0.proj
+      - txt_mlp.net.2
     engine_kwargs:
       # Explicit pipeline pin (ServerArgs.model_id, matched by registered short
       # name "Qwen-Image-Edit-2511") — local checkpoint dirs then need no special

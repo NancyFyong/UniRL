@@ -95,6 +95,7 @@ _SP_INJECT_FIELDS = {
 # Sentinels.
 _SP_INIT_SENTINEL = "_unirl_sampling_io_init"
 _PREP_SENTINEL = "_unirl_sampling_io_prepare"
+_VALIDATE_SENTINEL = "_unirl_sampling_io_validate"
 _REQ_FIELD = "denoise_seeds"
 
 
@@ -130,6 +131,17 @@ def patch_sampling_io() -> None:
     # hash (json.dumps(_json_safe(asdict(self)))) doesn't crash on a Tensor.
     _install_json_safe_tensor_guard(sp_mod)
 
+    # (5) Bypass the I2I ``image_path`` requirement when ``condition_image`` is
+    # set. Edit-Plus ships the source-image PIL via ``condition_image`` (a Req
+    # field populated in ``_wrap_prepare_request``), NOT via ``image_path`` (a
+    # file path). Upstream's ``_validate_with_pipeline_config`` raises
+    # ``ValueError`` for I2I task types when ``image_path is None`` — without
+    # this bypass the first ``generate()`` crashes before the PIL ever reaches
+    # ``InputValidationStage`` (which checks ``batch.condition_image is not
+    # None`` BEFORE ``image_path`` at input_validation.py:108, so the PIL path
+    # is correct once validation passes).
+    _wrap_validate_with_pipeline_config(SamplingParams)
+
 
 def _install_json_safe_tensor_guard(sp_mod) -> None:
     """Make ``sampling_params._json_safe`` tolerate ``torch.Tensor`` values.
@@ -160,6 +172,54 @@ def _install_json_safe_tensor_guard(sp_mod) -> None:
 
     _json_safe._unirl_tensor_safe = True  # type: ignore[attr-defined]
     sp_mod._json_safe = _json_safe
+
+
+# ------------------------------------------------------------------ #
+# (5) Bypass I2I image_path validation when condition_image is set
+# ------------------------------------------------------------------
+
+
+def _wrap_validate_with_pipeline_config(SamplingParams) -> None:
+    """AROUND-wrap ``_validate_with_pipeline_config`` to skip the I2I
+    ``image_path`` requirement when ``condition_image`` is populated.
+
+    Edit-Plus ships the source-image PIL via the ``condition_image`` field (a
+    Req dataclass field, populated by ``_wrap_prepare_request``), NOT via
+    ``image_path`` (a file-path string). Upstream's validation raises
+    ``ValueError`` for I2I task types when ``image_path is None`` — this would
+    crash the first ``generate()`` before the PIL reaches ``InputValidationStage``
+    (which checks ``batch.condition_image is not None`` BEFORE ``image_path``,
+    so the PIL path is correct once validation passes).
+
+    The wrap is a pure superset: when ``condition_image`` is None (T2I, or
+    Edit-Plus calls that genuinely use ``image_path``), the original validation
+    runs unchanged. Idempotent.
+    """
+    orig = SamplingParams.__dict__.get("_validate_with_pipeline_config")
+    if orig is None:
+        return  # pragma: no cover - upstream method missing
+    if getattr(orig, _VALIDATE_SENTINEL, False):
+        return
+
+    def _validate_with_pipeline_config(self, pipeline_config, __orig=orig):
+        # Edit-Plus path: condition_image carries the PIL, so the image_path
+        # requirement is moot. Skip ONLY the image_path-None check; defer
+        # everything else (including the accepts_image_input() reject path)
+        # to the original.
+        condition_image = getattr(self, "condition_image", None)
+        if condition_image is None:
+            return __orig(self, pipeline_config)
+
+        # Mirror upstream's logic but skip the image_path-None raise when
+        # condition_image is set. The accepts_image_input() reject path still
+        # fires for task types that don't accept image input at all.
+        if not pipeline_config.task_type.accepts_image_input():
+            if getattr(self, "image_path", None) is not None:
+                raise ValueError(f"input_reference is not supported for {pipeline_config.task_type.name} models.")
+        # I2I requires_image_input() is satisfied by condition_image; skip.
+
+    setattr(_validate_with_pipeline_config, _VALIDATE_SENTINEL, True)
+    SamplingParams._validate_with_pipeline_config = _validate_with_pipeline_config
 
 
 # ------------------------------------------------------------------ #
