@@ -82,6 +82,14 @@ _SP_INJECT_FIELDS = {
     "denoise_seeds": (None, "list[str] | None"),
     "return_prompt_embeds": (False, "bool"),
     "return_negative_prompt_embeds": (False, "bool"),
+    # Edit-Plus source-image PIL. ``Req.condition_image`` is a real dataclass
+    # field (schedule_batch.py:59), but ``SamplingParams`` lacks it, so without
+    # injection a PIL passed in sampling kwargs would be dropped at
+    # ``SamplingParams`` construction. SGLang's ``InputValidationStage`` checks
+    # ``batch.condition_image is not None`` BEFORE ``image_path``
+    # (input_validation.py:108), so pre-populating it via this field bypasses
+    # the file-path load. ``_wrap_prepare_request`` copies it onto the Req.
+    "condition_image": (None, "Any"),
 }
 
 # Sentinels.
@@ -340,6 +348,15 @@ def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
         denoise_seeds = getattr(sampling_params, "denoise_seeds", None)
         if denoise_seeds is not None:
             req.denoise_seeds = denoise_seeds
+
+        # Edit-Plus source-image PIL. Req.condition_image is a real dataclass
+        # field (schedule_batch.py:59), so this assignment lands on the Req
+        # directly (not delegated to sampling_params). Upstream's
+        # InputValidationStage then preprocesses the PIL (resize + VAE encode
+        # → batch.image_latent). No-op when the adapter didn't set it (T2I).
+        condition_image = getattr(sampling_params, "condition_image", None)
+        if condition_image is not None:
+            req.condition_image = condition_image
 
         return req
 
