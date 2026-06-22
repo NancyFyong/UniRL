@@ -34,7 +34,7 @@ bundle:
   _target_: unirl.models.qwen_image_edit_plus.bundle.QwenImageEditPlusBundle.from_config
   config:
     _target_: unirl.models.qwen_image_edit_plus.config.QwenImageEditPlusPipelineConfig
-    pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_EDIT_PLUS_PATH,/efs/linyongpan/code/models/Qwen/Qwen-Image-Edit-2511-merged_v9.7}
+    pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_EDIT_PLUS_PATH,Qwen/Qwen-Image-Edit-2511}
     model_precision: bf16
     max_sequence_length: 512
     # Trainer-side TE is dead weight on the separate-engine path (the
@@ -120,7 +120,7 @@ rollout:
   model_config: ${bundle.config}
   config:
     _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
-    model_path: ${oc.env:QWEN_IMAGE_EDIT_PLUS_PATH,/efs/linyongpan/code/models/Qwen/Qwen-Image-Edit-2511-merged_v9.7}
+    model_path: ${oc.env:QWEN_IMAGE_EDIT_PLUS_PATH,Qwen/Qwen-Image-Edit-2511}
     # Edit-Plus image-edit modality (NEW; accepts req.primitives['image'],
     # injects PIL into prompt['multi_modal_data']['image'] for upstream's
     # get_qwen_image_edit_plus_pre_process_func).

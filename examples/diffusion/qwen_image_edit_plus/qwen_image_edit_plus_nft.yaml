@@ -34,7 +34,7 @@ bundle:
   _target_: unirl.models.qwen_image_edit_plus.bundle.QwenImageEditPlusBundle.from_config
   config:
     _target_: unirl.models.qwen_image_edit_plus.config.QwenImageEditPlusPipelineConfig
-    pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_EDIT_PLUS_PATH,/efs/linyongpan/code/models/Qwen/Qwen-Image-Edit-2511-merged_v9.7}
+    pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_EDIT_PLUS_PATH,Qwen/Qwen-Image-Edit-2511}
     model_precision: bf16
     max_sequence_length: 512
     shift: 3.0
