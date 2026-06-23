@@ -119,8 +119,22 @@ class LoraWeightSyncBase(Remote):
         equality is a strong bit-equality proof and also catches a wrong
         ``param_prefix`` (which yields wrong / zero loaded layers). ``loaded`` is a
         ``{stage_id: [per_rank {layer: {field: hex}}]}`` map.
+
+        When the rollout engine is dead (e.g. worker SIGKILL'd during the train
+        step), ``collective_rpc`` returns ``{"supported": False, "error": ...}``
+        per stage instead of the per-rank list. Detect that shape and surface the
+        underlying error rather than crashing with a confusing ``AttributeError``
+        on the dict's string keys.
         """
         for stage_id, per_rank in loaded.items():
+            # Engine-dead / RPC-failure shape: stage_pool.collective_rpc catches
+            # exceptions and returns {"supported": False, "error": str(exc)}.
+            if isinstance(per_rank, dict) and not per_rank.get("supported", True):
+                raise RuntimeError(
+                    f"[LoRA-SYNC] verify FAILED on {label}, stage {stage_id}: rollout "
+                    f"engine RPC returned an error — the engine is likely dead. "
+                    f"Underlying error: {per_rank.get('error', '<unknown>')}"
+                )
             for rank_idx, layer_map in enumerate(per_rank):
                 act_a = sorted(f["lora_a"] for f in layer_map.values() if "lora_a" in f)
                 act_b = sorted(f["lora_b"] for f in layer_map.values() if "lora_b" in f)

@@ -163,11 +163,17 @@ class VLLMOmniBackend:
         *,
         tokenizer: Optional[Any],
         tp_per_stage: Dict[int, int],
+        boot_intent: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._omni: Optional[Any] = omni
         self._rt = runtime
         self._tokenizer = tokenizer
         self._tp_per_stage = dict(tp_per_stage)
+        # Persisted boot intent for :meth:`reboot` — the only way to recover
+        # from the vllm-omni executor's permanent-failure state (DiffusionWorker
+        # death after sleep Level 1 in colocate mode sets ``_closed=True`` with
+        # no recovery; see ``multiproc_executor.py``).
+        self._boot_intent: Optional[Dict[str, Any]] = dict(boot_intent) if boot_intent is not None else None
 
     # ------------------------------------------------------------------ #
     # Boot — the only place the runtime import / spawn / env override live
@@ -209,28 +215,36 @@ class VLLMOmniBackend:
         if intent.get("clear_cuda_visible"):
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
-        # 4. Spawn Omni off the pristine YAML asset + the assembled kwargs.
-        #
-        # Node-local boot serialization: colocated replicas (8 per node) each
-        # spawn worker subprocesses that hold ~20 GiB anon RSS while
-        # materializing weights (safetensors -> dtype-cast staging). Eight
-        # simultaneous boots burst past the pod's k8s memcg limit and the
-        # kernel OOM-kills raylet/python (LIN-382 qwen probe, 2026-06-07:
-        # "Memory cgroup out of memory: Killed process ... anon-rss:
-        # 20216496kB", raylet SIGKILL -> ActorUnavailableError). An exclusive
-        # flock makes the heavy-load window single-file per node — boots take
-        # N * t_load instead of dying; it also narrows the master-port settle
-        # TOCTOU window as a side effect. Disable via
-        # DIFFRL_OMNI_BOOT_SERIALIZE=0 (e.g. single-replica smokes).
+        omni, tokenizer = cls._spawn_omni(intent, rt)
+
+        return cls(
+            omni,
+            rt,
+            tokenizer=tokenizer,
+            # The runtime's own merged per-stage configs — authoritative,
+            # no YAML re-read.
+            tp_per_stage=_tp_from_stage_configs(omni.stage_configs),
+            boot_intent=intent,
+        )
+
+    @staticmethod
+    def _spawn_omni(intent: Dict[str, Any], rt: Dict[str, Any]) -> tuple:
+        """Spawn the ``Omni`` orchestrator + driver tokenizer from ``intent``.
+
+        Shared between :meth:`boot` (first construction) and :meth:`reboot`
+        (recovery after DiffusionWorker death). Holds the per-node boot
+        serialization flock so colocated replicas don't burst past the k8s
+        memcg limit on re-spawn.
+        """
         import fcntl
 
         # Return the host process's reserved-but-unallocated CUDA pool to the
-        # driver before spawning the engine. boot() runs inside the trainer's
-        # ray actor: the colocate flow full-loads the model per rank before
-        # FSDP shards it, leaving ~35-40 GiB reserved in THIS process's torch
-        # caching allocator — memory the engine SUBPROCESS cannot see or use
-        # (LIN-382 qwen probe-c: engine model 53.7 GiB + dummy run hit "116
-        # MiB free" on a 95 GiB GPU with the trainer's pool holding the rest).
+        # driver before spawning the engine. Runs inside the trainer's ray actor:
+        # the colocate flow full-loads the model per rank before FSDP shards it,
+        # leaving ~35-40 GiB reserved in THIS process's torch caching allocator —
+        # memory the engine SUBPROCESS cannot see or use (LIN-382 qwen probe-c:
+        # engine model 53.7 GiB + dummy run hit "116 MiB free" on a 95 GiB GPU
+        # with the trainer's pool holding the rest).
         try:
             import torch
 
@@ -261,14 +275,7 @@ class VLLMOmniBackend:
         if intent.get("needs_driver_tokenizer"):
             tokenizer = rt["AutoTokenizer"].from_pretrained(str(intent["model_path"]), trust_remote_code=True)
 
-        return cls(
-            omni,
-            rt,
-            tokenizer=tokenizer,
-            # The runtime's own merged per-stage configs — authoritative,
-            # no YAML re-read.
-            tp_per_stage=_tp_from_stage_configs(omni.stage_configs),
-        )
+        return omni, tokenizer
 
     def _require_omni(self) -> Any:
         if self._omni is None:
@@ -388,22 +395,101 @@ class VLLMOmniBackend:
             )
 
     def wake_task(self) -> None:
-        """Fan ``handle_wake_task`` to every stage's workers + sync CUDA."""
+        """Fan ``handle_wake_task`` to every stage's workers + sync CUDA.
+
+        Self-heals from the vllm-omni executor's permanent-failure state
+        (DiffusionWorker death after sleep Level 1 in colocate mode): if the
+        wake RPC raises ``DiffusionExecutor is closed.``, reboot the ``Omni``
+        engine from the persisted boot intent and re-run the wake fan-out
+        once. The caller (:meth:`VLLMOmniRolloutEngine.wake_up`) then
+        re-pushes LoRA from its cached tensors. On second failure, re-raise
+        (fail-fast — constraint #27).
+        """
         import uuid
 
         import torch
 
-        omni = self._require_omni()
-        for sid in self._stage_ids():
-            omni.engine.collective_rpc(
-                method="handle_wake_task",
-                args=(self._rt["OmniWakeTask"](tags=None, task_id=str(uuid.uuid4())),),
-                stage_ids=[int(sid)],
+        try:
+            omni = self._require_omni()
+            for sid in self._stage_ids():
+                omni.engine.collective_rpc(
+                    method="handle_wake_task",
+                    args=(self._rt["OmniWakeTask"](tags=None, task_id=str(uuid.uuid4())),),
+                    stage_ids=[int(sid)],
+                )
+        except RuntimeError as exc:
+            if not self._is_closed_executor_error(exc):
+                raise
+            logger.warning(
+                "VLLMOmniBackend.wake_task: executor closed (DiffusionWorker "
+                "died after sleep). Rebooting Omni engine from persisted intent. "
+                "Original error: %r",
+                exc,
             )
+            self.reboot()
+            omni = self._require_omni()
+            for sid in self._stage_ids():
+                omni.engine.collective_rpc(
+                    method="handle_wake_task",
+                    args=(self._rt["OmniWakeTask"](tags=None, task_id=str(uuid.uuid4())),),
+                    stage_ids=[int(sid)],
+                )
         if torch.cuda.is_available():
             # Mirrors AsyncOmni.wake_up's synchronize(); ensures pool
             # restoration is visible before the next generate.
             torch.cuda.synchronize()
+
+    @staticmethod
+    def _is_closed_executor_error(exc: BaseException) -> bool:
+        """True if ``exc`` is the vllm-omni closed-executor RuntimeError."""
+        msg = str(exc)
+        return "DiffusionExecutor is closed" in msg or "is closed" in msg
+
+    def _is_dead(self) -> bool:
+        """Probe whether the executor is in permanent-failure state.
+
+        Best-effort: tries a stage-0 ``collective_rpc`` and returns True if it
+        raises the closed-executor error. Used defensively; the primary
+        recovery path is the try/except in :meth:`wake_task`.
+        """
+        if self._omni is None:
+            return True
+        try:
+            self._omni.engine.collective_rpc(method="ping", stage_ids=[0])
+            return False
+        except RuntimeError as exc:
+            return self._is_closed_executor_error(exc)
+        except Exception:  # noqa: BLE001 — conservative: treat unknown as not-dead
+            return False
+
+    def reboot(self) -> None:
+        """Recreate the ``Omni`` engine from the persisted boot intent.
+
+        Recovery for the vllm-omni executor's permanent-failure state
+        (``multiproc_executor.py`` sets ``_closed=True`` with no recovery when
+        a DiffusionWorker dies). Shuts down the dead ``Omni``, re-spawns a
+        fresh one from ``self._boot_intent``, and refreshes ``_tp_per_stage``.
+
+        Raises:
+            RuntimeError: if no boot intent was persisted (legacy backend) or
+                the re-spawn itself fails (fail-fast — constraint #27).
+        """
+        if self._boot_intent is None:
+            raise RuntimeError(
+                "VLLMOmniBackend.reboot: no boot intent persisted — cannot "
+                "recover. This backend was constructed without boot_intent "
+                "(legacy path); update the constructor to persist it."
+            )
+        logger.warning("VLLMOmniBackend.reboot: shutting down dead Omni engine.")
+        self.shutdown()
+        # Re-spawn. Patches + start method are already installed from the
+        # original boot(); _spawn_omni only needs the intent + runtime.
+        omni, tokenizer = self._spawn_omni(self._boot_intent, self._rt)
+        self._omni = omni
+        if tokenizer is not None:
+            self._tokenizer = tokenizer
+        self._tp_per_stage = _tp_from_stage_configs(omni.stage_configs)
+        logger.warning("VLLMOmniBackend.reboot: new Omni engine spawned successfully.")
 
     def ping(self) -> bool:
         return self._omni is not None
