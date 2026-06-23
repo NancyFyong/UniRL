@@ -60,9 +60,26 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
 from dataclasses import field
 
 logger = logging.getLogger(__name__)
+
+# Thread-local stash for the per-prompt ``condition_image`` index.
+#
+# Upstream ``DiffGenerator.generate`` (diffusion_generator.py:209-221) loops
+# over prompts and builds one ``Req`` per prompt via ``dataclasses.replace``
+# + ``prepare_request``. It indexes ``image_path`` per prompt via
+# ``_resolve_image_paths_per_prompt`` but does NOT index ``condition_image`` --
+# so every per-prompt ``sampling_params`` carries the WHOLE list, and
+# ``InputValidationStage.preprocess_condition_image`` (input_validation.py:117)
+# then uses ``batch.condition_image[-1]`` as the source image. Every prompt in
+# a multi-prompt batch ends up conditioned on the LAST source image.
+#
+# We fix this by stashing the list in thread-local state at the start of
+# ``generate`` and indexing it per Req in ``_wrap_prepare_request`` (which
+# upstream calls once per prompt, in prompt order, in the same thread).
+_local = threading.local()
 
 # Fork field name -> (default, human-readable type) for SamplingParams injection.
 # Defaults/types mirror the fork's sampling_params.py diff (sigmas/timesteps real
@@ -142,6 +159,14 @@ def patch_sampling_io() -> None:
     # is correct once validation passes).
     _wrap_validate_with_pipeline_config(SamplingParams)
 
+    # (6) Index ``condition_image`` per prompt. Upstream's per-prompt loop in
+    # ``DiffGenerator.generate`` indexes ``image_path`` but NOT
+    # ``condition_image``, so a multi-prompt batch would condition every prompt
+    # on the last source image (input_validation.py:117). Stash the list at
+    # the start of ``generate`` and index it per Req in
+    # ``_wrap_prepare_request``.
+    _wrap_diff_generator_generate()
+
 
 def _install_json_safe_tensor_guard(sp_mod) -> None:
     """Make ``sampling_params._json_safe`` tolerate ``torch.Tensor`` values.
@@ -220,6 +245,78 @@ def _wrap_validate_with_pipeline_config(SamplingParams) -> None:
 
     setattr(_validate_with_pipeline_config, _VALIDATE_SENTINEL, True)
     SamplingParams._validate_with_pipeline_config = _validate_with_pipeline_config
+
+
+# ------------------------------------------------------------------ #
+# (6) Per-prompt condition_image indexing in DiffGenerator.generate
+# ------------------------------------------------------------------
+
+
+_GEN_SENTINEL = "_unirl_diff_gen_index"
+
+
+def _wrap_diff_generator_generate() -> None:
+    """AROUND-wrap ``DiffGenerator.generate`` to index ``condition_image``
+    per prompt.
+
+    Upstream's per-prompt loop (diffusion_generator.py:209-221) indexes
+    ``image_path`` via ``_resolve_image_paths_per_prompt`` but NOT
+    ``condition_image`` -- every per-prompt ``dataclasses.replace`` carries
+    the whole list, and ``InputValidationStage.preprocess_condition_image``
+    (input_validation.py:117) then uses ``batch.condition_image[-1]`` as the
+    source image. Every prompt in a multi-prompt batch ends up conditioned
+    on the LAST source image.
+
+    This wrap stashes the list in thread-local state at the start of
+    ``generate``; ``_wrap_prepare_request`` (called once per prompt, in
+    prompt order, in the same thread) consumes one element per call.
+    Single-prompt path (list len 1 or scalar PIL) is a passthrough.
+
+    Safety: ``generate`` is synchronous in ``local_mode=True`` (the only
+    mode UniRL uses) and calls ``prepare_request`` sequentially in the same
+    thread, so the thread-local counter is correct. Concurrent ``generate``
+    calls in different threads each get their own thread-local slot.
+
+    Idempotent. No-op when ``DiffGenerator`` is unavailable in this
+    interpreter (e.g. a CPU-only unit-test process importing only the
+    rollout math).
+    """
+    try:
+        from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+            DiffGenerator,
+        )
+    except Exception:  # pragma: no cover - environment dependent
+        return
+
+    orig = DiffGenerator.__dict__.get("generate")
+    if orig is None:
+        return
+    if getattr(orig, _GEN_SENTINEL, False):
+        return
+
+    def generate(self, sampling_params_kwargs=None, __orig=orig):
+        # Stash the per-prompt condition_image list BEFORE the per-prompt loop
+        # so _wrap_prepare_request can index it. Reset the counter regardless
+        # so a leftover stash from a prior call can't corrupt this one.
+        ci = (sampling_params_kwargs or {}).get("condition_image")
+        if isinstance(ci, list) and len(ci) > 1:
+            _local.condition_image_per_prompt = ci
+            _local.condition_image_idx = 0
+        else:
+            # Clear any stale stash so _wrap_prepare_request falls back to the
+            # scalar-PIL passthrough (single prompt or T2I).
+            _local.condition_image_per_prompt = None
+            _local.condition_image_idx = 0
+        try:
+            return __orig(self, sampling_params_kwargs)
+        finally:
+            # Always clear so a later T2I call in the same thread can't pick
+            # up a stale Edit-Plus stash.
+            _local.condition_image_per_prompt = None
+            _local.condition_image_idx = 0
+
+    setattr(generate, _GEN_SENTINEL, True)
+    DiffGenerator.generate = generate
 
 
 # ------------------------------------------------------------------ #
@@ -416,6 +513,26 @@ def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
         # → batch.image_latent). No-op when the adapter didn't set it (T2I).
         condition_image = getattr(sampling_params, "condition_image", None)
         if condition_image is not None:
+            # Multi-prompt indexing: when the adapter emitted a list of PILs
+            # (one per unique prompt), upstream's per-prompt loop in
+            # ``DiffGenerator.generate`` carries the WHOLE list on every
+            # per-prompt ``sampling_params`` (it indexes ``image_path`` but
+            # not ``condition_image``). ``_wrap_diff_generator_generate``
+            # stashed the list in thread-local state at the start of
+            # ``generate``; index it per Req here, mirroring
+            # ``image_paths_per_prompt[i]``. Single-prompt path (list len 1
+            # or scalar PIL) is a passthrough.
+            stash = getattr(_local, "condition_image_per_prompt", None)
+            if isinstance(stash, list) and len(stash) > 1:
+                idx = getattr(_local, "condition_image_idx", 0)
+                if idx >= len(stash):
+                    raise RuntimeError(
+                        f"prepare_request: condition_image index {idx} >= "
+                        f"stash length {len(stash)} — generate() prompt count "
+                        f"mismatch. This is a UniRL patch bug."
+                    )
+                condition_image = stash[idx]
+                _local.condition_image_idx = idx + 1
             req.condition_image = condition_image
 
         return req
