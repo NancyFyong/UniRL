@@ -89,8 +89,13 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
             raise ValueError(f"build_prompts: image batch {len(pil_images)} != prompt count {len(prompts)}")
         # Collapse PILs in parallel with prompts: one image per unique prompt.
         if k > 1:
-            # K-expanded: all K share the same source image per group; take one.
-            unique_pils = pil_images[: len(unique_prompts)]
+            # K-expanded: all K samples in a group share the same source image
+            # (same prompt + same source, K different noise draws). The PILs
+            # are laid out group-major — ``pil_images[g*k : (g+1)*k]`` are the
+            # K copies for group ``g`` — so stride ``[::k]`` picks one per
+            # group. (``[:N]`` would be wrong when ``N <= K``: all N picks
+            # would land inside group 0.)
+            unique_pils = pil_images[::k]
         else:
             unique_pils = pil_images
         out: Dict[str, Any] = {
