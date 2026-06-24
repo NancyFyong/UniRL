@@ -147,6 +147,19 @@ class SGLangBackend:
         if disable_autocast is not None:
             server_args.disable_autocast = disable_autocast
 
+        # Remote mode (prelaunch): this actor is a CLIENT to an externally
+        # launched SGLang server. ServerArgs.__post_init__ → _adjust_network_ports
+        # → settle_port() sees the prelaunched scheduler_port already bound and
+        # silently rebinds the client to a free port (e.g. 50111 → 50153), so
+        # sync_scheduler_client then connects to a port where nothing listens.
+        # Restore the intent's ports — the client must connect to the server,
+        # not rebind. (Local mode is unaffected: launch_server binds the same
+        # port the client uses, and the spawn happens in-process.)
+        if not local_mode:
+            for port_field in ("port", "scheduler_port", "master_port"):
+                if server_kwargs.get(port_field) is not None:
+                    setattr(server_args, port_field, server_kwargs[port_field])
+
         generator = rt["DiffGenerator"].from_pretrained(
             server_args=server_args,
             local_mode=bool(local_mode),
