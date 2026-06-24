@@ -113,13 +113,33 @@ def launch_sglang_server_process(
     # Pickle the intent to a temp file the subprocess reads back. Avoids
     # thousands of CLI args and the quoting/typing hazards of a big ServerArgs.
     fd, intent_path = tempfile.mkstemp(prefix="sglang_prelaunch_", suffix=".pkl")
+    # Readiness file: the subprocess creates it AFTER launch_server() returns
+    # (i.e. the scheduler has entered its recv loop). Waiting on the TCP port
+    # is NOT enough — SGLang binds the ZMQ REP socket during model loading,
+    # 40+ s before the scheduler loop starts accepting requests. A TCP probe
+    # succeeds prematurely and the worker's first ping then fails with
+    # ConnectionError.
+    fd_ready, readiness_path = tempfile.mkstemp(prefix="sglang_prelaunch_ready_", suffix=".ok")
+    os.close(fd_ready)
+    os.unlink(readiness_path)  # subprocess re-creates it when ready
     try:
         with os.fdopen(fd, "wb") as f:
             pickle.dump(server_intent, f)
-        return _spawn_and_wait(intent_path, host, int(scheduler_port), device_ids, python_executable)
+        return _spawn_and_wait(
+            intent_path,
+            host,
+            int(scheduler_port),
+            device_ids,
+            python_executable,
+            readiness_path,
+        )
     finally:
         try:
             os.unlink(intent_path)
+        except OSError:
+            pass
+        try:
+            os.unlink(readiness_path)
         except OSError:
             pass
 
@@ -130,6 +150,7 @@ def _spawn_and_wait(
     scheduler_port: int,
     device_ids: List[int],
     python_executable: Optional[str],
+    readiness_path: str,
 ) -> Tuple[subprocess.Popen, str, int]:
     py = python_executable or sys.executable
     env = dict(os.environ)
@@ -138,6 +159,10 @@ def _spawn_and_wait(
     # hijack's wrap_mp_process_for_children re-installs patches in the
     # scheduler's spawn children — correct and desired.
     env["SGLANG_DIFFUSION_PATCHES"] = "1"
+    # Hand the readiness file path to the subprocess; it touches the file
+    # after launch_server() returns so the driver's wait loop can detect
+    # true scheduler-loop readiness (not just ZMQ bind).
+    env["UNIRL_SGLANG_PRELAUNCH_READY_FILE"] = readiness_path
 
     cmd = [py, "-m", "unirl.rollout.engine.sglang_diffusion.prelaunch", intent_path]
     log_prefix = f"[sglang-prelaunch host={host} port={scheduler_port} gpus={device_ids}]"
@@ -175,20 +200,21 @@ def _spawn_and_wait(
                 out = b""
             raise RuntimeError(
                 f"{log_prefix} subprocess exited with code {popen.returncode} "
-                f"before the scheduler bound its port. Log file: "
+                f"before the scheduler was ready. Log file: "
                 f"{prelaunch_log_path}\nOutput:\n"
                 f"{out.decode('utf-8', errors='replace')}"
             )
-        if _port_is_open(host, scheduler_port):
-            logger.info("%s scheduler is up.", log_prefix)
+        if os.path.exists(readiness_path):
+            logger.info("%s scheduler is up (readiness file signaled).", log_prefix)
             return popen, host, scheduler_port
         time.sleep(_PING_INTERVAL_S)
 
     # Timed out — kill the subprocess and report.
     terminate(popen)
     raise RuntimeError(
-        f"{log_prefix} scheduler did not bind {host}:{scheduler_port} within "
-        f"{_PING_TIMEOUT_S}s. Log file: {prelaunch_log_path}"
+        f"{log_prefix} scheduler did not become ready within "
+        f"{_PING_TIMEOUT_S}s (no readiness file at {readiness_path}). "
+        f"Log file: {prelaunch_log_path}"
     )
 
 
@@ -266,6 +292,19 @@ def _main(intent_path: str) -> None:
     )
     processes = launch_server(server_args, launch_http_server=False)
     logger.info("launch_server returned %d worker process(es).", len(processes))
+
+    # Signal readiness to the driver — launch_server has returned, which means
+    # the scheduler worker(s) have entered their recv loops and will accept
+    # ZMQ requests. The driver waits on this file (NOT a TCP probe) so the
+    # first worker ping does not race the scheduler loop startup.
+    ready_file = os.environ.get("UNIRL_SGLANG_PRELAUNCH_READY_FILE")
+    if ready_file:
+        try:
+            with open(ready_file, "w") as f:
+                f.write(f"ready pid={os.getpid()} port={server_args.scheduler_port}\n")
+            logger.info("wrote readiness file %s", ready_file)
+        except OSError as exc:
+            logger.warning("could not write readiness file %s: %s", ready_file, exc)
 
     # Block until any worker exits. The daemon children keep running as long as
     # this process lives; when it exits, they die with it (daemon=True).
