@@ -182,7 +182,19 @@ class QwenImageEditPlusT2iAdapter(ModelAdapter):
             raise ValueError(f"modality={self.modality!r} requires req.primitives['image'] (Edit-Plus is edit-only).")
 
     def build_inputs(self, req: RolloutReq) -> List[GenerateCall]:
-        return self.input_adapter.build(req)
+        calls: List[GenerateCall] = []
+        for idx in range(req.batch_size):
+            # Upstream QwenImageEditPlusPipeline.forward consumes only req.prompts[0].
+            single_req = req.slice(idx, idx + 1)
+            call = self.input_adapter.build(single_req)[0]
+            calls.append(
+                GenerateCall(
+                    prompts=call.prompts,
+                    sampling=call.sampling,
+                    group_by_request_id=False,
+                )
+            )
+        return calls
 
     def build_response(self, req: RolloutReq, per_request: List[List[OmniRawResult]]) -> RolloutResp:
         return self.output_adapter.build(req, per_request)
