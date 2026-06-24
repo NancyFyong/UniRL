@@ -96,11 +96,6 @@ class DiffusionTrainer(BaseTrainer):
         # needs the EMA dual-adapter swap around rollout. Stays False for GRPO
         # so its hot path is untouched.
         self._uses_ema = False
-        # Driver-side handles to pre-launched SGLang server subprocesses (one
-        # per sglang_diffusion engine with prelaunch=True). Kept here so the
-        # trainer can terminate them on shutdown. See
-        # unirl.rollout.engine.sglang_diffusion.prelaunch.
-        self._sglang_prelaunch_procs: list = []
 
         # Driver-side data iterator (not a Remote).
         self.data_source = instantiate(data_source_cfg)
@@ -222,90 +217,7 @@ class DiffusionTrainer(BaseTrainer):
             # the backend's SP degree (sp_size is a handle-layout hint, stripped
             # before the engine __init__; the pipeline sibling alone is flat).
             return remote(**rollout_parsed, pipeline=self.pipeline, sp_size=self.backend.sp_size)  # direct sampling
-        # sglang_diffusion prelaunch: if the engine opts in via prelaunch=True,
-        # spawn the SGLang server as a driver-side subprocess BEFORE the Ray
-        # Worker actor starts. Bypasses the mp.Pipe fd-inheritance hang that
-        # affects launch_server() inside a Ray actor (see
-        # unirl.rollout.engine.sglang_diffusion.prelaunch).
-        self._maybe_prelaunch_sglang(rollout_parsed)
         return remote(**rollout_parsed)  # vllm / sglang
-
-    def _maybe_prelaunch_sglang(self, rollout_parsed: dict) -> None:
-        """Pre-launch an SGLang server subprocess if the config opts in.
-
-        Mutates ``rollout_parsed`` in place: when ``config.prelaunch`` is True,
-        forces ``local_mode=False`` and injects the resolved ``host`` /
-        ``scheduler_port`` so each Worker actor's engine ctor connects to the
-        pre-launched server (no mp.Pipe, no hang). Stores the ``Popen`` handle
-        on ``self._sglang_prelaunch_procs`` for shutdown.
-
-        No-op for non-sglang engines or when ``prelaunch`` is False/absent.
-        """
-        config_dict = rollout_parsed.get("config")
-        if not isinstance(config_dict, dict):
-            return
-        if not config_dict.get("prelaunch"):
-            return
-        # Build the SGLangDiffusionEngineConfig + model_config on the driver so
-        # we can spell the server intent (model_path, parallelism, ports).
-        from unirl.rollout.engine.sglang_diffusion.config import (
-            SGLangDiffusionEngineConfig,
-        )
-        from unirl.rollout.engine.sglang_diffusion.prelaunch import (
-            launch_sglang_server_process,
-        )
-
-        cfg_kwargs = {k: v for k, v in config_dict.items() if k != "_target_"}
-        sglang_cfg = SGLangDiffusionEngineConfig(**cfg_kwargs)
-        # Instantiate model_config (a nested _target_ block) to read
-        # pretrained_model_ckpt_path / use_lora / lora_target_modules.
-        model_config = instantiate({"_target_": rollout_parsed["model_config"]["_target_"],
-                                    **{k: v for k, v in rollout_parsed["model_config"].items()
-                                       if k != "_target_"}})
-        # Resolve the adapter (registers model_family) for boot_kwargs.
-        from unirl.rollout.engine.sglang_diffusion.adapters import get_adapter
-        adapter_cls = get_adapter(sglang_cfg.model_family)
-        adapter = adapter_cls(sglang_cfg, model_config, strategy=None)
-        intent = sglang_cfg.server_intent(
-            model_config=model_config,
-            ports=None,  # remote mode — no local port reservation
-            extra=adapter.boot_kwargs(),
-        )
-        # Device ids for the subprocess's CUDA_VISIBLE_DEVICES. The current
-        # placement scope owns the rollout slab's devices.
-        from unirl.distributed.group.placement import current_placement
-        scope = current_placement()
-        device_ids = list(scope.devices) if scope is not None else []
-        popen, host, scheduler_port = launch_sglang_server_process(
-            intent, device_ids=device_ids
-        )
-        self._sglang_prelaunch_procs.append(popen)
-        # Mutate the parsed kwargs so the Worker actor's engine ctor sees the
-        # resolved endpoint and connects in remote mode.
-        rollout_parsed["config"]["local_mode"] = False
-        rollout_parsed["config"]["host"] = host
-        rollout_parsed["config"]["scheduler_port"] = int(scheduler_port)
-        logger.info(
-            "Pre-launched SGLang server for rollout engine on devices %s "
-            "(host=%s, scheduler_port=%d, pid=%d)",
-            device_ids, host, scheduler_port, popen.pid,
-        )
-
-    def shutdown(self) -> None:
-        """Terminate any pre-launched SGLang server subprocesses.
-
-        Called by the training loop on clean exit. The Ray Worker actors'
-        engine ZMQ clients close on their own; the pre-launched server
-        subprocesses are driver-owned and need explicit termination.
-        """
-        from unirl.rollout.engine.sglang_diffusion.prelaunch import terminate
-
-        for popen in self._sglang_prelaunch_procs:
-            try:
-                terminate(popen)
-            except Exception:  # noqa: BLE001 — best-effort cleanup
-                logger.warning("Failed to terminate SGLang prelaunch process %d", popen.pid, exc_info=True)
-        self._sglang_prelaunch_procs.clear()
 
     def _connect_separate(self, sync_cfg: DictConfig) -> None:
         """One-time cross-slab handshake: hand rank 0 the rollout Worker handles.
