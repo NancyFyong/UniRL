@@ -73,14 +73,6 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
     local_mode: bool = True
     disable_autocast: bool = False
 
-    # --- Pre-launch (driver-side subprocess) ---
-    # When True, the driver launches the SGLang server as a subprocess.Popen
-    # BEFORE the Ray Worker actor starts, then each actor connects in remote
-    # mode (local_mode=False). Bypasses the mp.Pipe fd-inheritance hang that
-    # affects launch_server() when it runs inside a Ray actor. See
-    # prelaunch.py and unified_model._wire_engine.
-    prelaunch: bool = False
-
     # --- Forward chunking (None = whole batch in one forward) ---
     forward_batch_size: Optional[int] = None
 
@@ -125,19 +117,9 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
             self.forward_batch_size is None or self.forward_batch_size >= 1,
             f"forward_batch_size must be >= 1 when set; got {self.forward_batch_size!r}",
         )
-        # prelaunch forces remote mode — the driver launches SGLang as a
-        # subprocess and injects host/scheduler_port before create_remote, so
-        # they may be unset here (validated again after injection in _wire_engine).
         require(
-            not self.prelaunch or not self.local_mode,
-            "prelaunch=True requires local_mode=False (prelaunch spawns an "
-            "external server; local_mode=True would still call launch_server "
-            "inside the actor and hit the mp.Pipe hang).",
-        )
-        _remote_needs_endpoint = (not self.local_mode) and not self.prelaunch
-        require(
-            not _remote_needs_endpoint or (self.host is not None and self.scheduler_port is not None),
-            f"remote mode (local_mode=False, prelaunch=False) requires host and scheduler_port; "
+            self.local_mode or (self.host is not None and self.scheduler_port is not None),
+            f"remote mode (local_mode=False) requires host and scheduler_port; "
             f"got host={self.host!r}, scheduler_port={self.scheduler_port!r}",
         )
         require(
