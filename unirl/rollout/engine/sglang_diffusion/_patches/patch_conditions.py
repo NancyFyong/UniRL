@@ -507,7 +507,18 @@ def _wrap_result_common(DiffGenerator) -> None:
         common = raw(req, output_batch, generation_time, output_index)
         idx = 0 if output_index is None else int(output_index)
         for name in _COND_FIELDS:
-            common[name] = _slice_embed_list(getattr(output_batch, name, None), idx)
+            val = getattr(output_batch, name, None)
+            if name == "image_latent_sizes":
+                # image_latent_sizes is list[tuple[int,int]] per encoder (NOT
+                # per-output — all outputs in a group share one source image).
+                # _merge_conditions already took tensors[0] across batches, so
+                # the merged value has exactly one entry per encoder. Slicing
+                # by output_index would index past it (e.g. [(1024,1024)][3:4]
+                # = []) → "got 0 source images" in _collect_image_latents.
+                # Pass through unchanged.
+                common[name] = val
+            else:
+                common[name] = _slice_embed_list(val, idx)
         return common
 
     setattr(_result_common, _RESULT_COMMON_SENTINEL, True)

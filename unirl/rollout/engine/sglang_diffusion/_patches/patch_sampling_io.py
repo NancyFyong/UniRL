@@ -167,6 +167,17 @@ def patch_sampling_io() -> None:
     # ``_wrap_prepare_request``.
     _wrap_diff_generator_generate()
 
+    # (7) Upstream's ``InputValidationStage.forward`` only calls
+    # ``preprocess_condition_image`` (which sets ``batch.vae_image_sizes`` via
+    # ``config.preprocess_vae_image``) inside the ``if batch.image_path is not
+    # None`` branch. Edit-Plus ships the source image as a PIL via
+    # ``condition_image`` with ``image_path=None``, so that branch is skipped
+    # and ``vae_image_sizes`` stays None → ``_prepare_edit_cond_kwargs`` raises
+    # ``TypeError: 'NoneType' object is not iterable``. Wrap forward to invoke
+    # ``preprocess_condition_image`` when ``condition_image`` is set but
+    # ``image_path`` is not.
+    _wrap_input_validation_condition_image()
+
 
 def _install_json_safe_tensor_guard(sp_mod) -> None:
     """Make ``sampling_params._json_safe`` tolerate ``torch.Tensor`` values.
@@ -189,6 +200,11 @@ def _install_json_safe_tensor_guard(sp_mod) -> None:
     def _json_safe(obj):
         if torch.is_tensor(obj):
             return f"<tensor:{tuple(obj.shape)}:{obj.dtype}>"
+        # PIL.Image.Image (Edit-Plus ``condition_image``) — not JSON
+        # serializable; only feeds the output-filename hash, so a placeholder
+        # is harmless. ``save_output=False`` in rollout anyway.
+        if obj.__class__.__name__ == "Image" or obj.__class__.__module__.startswith("PIL."):
+            return f"<pil:{getattr(obj, 'size', None)}:{getattr(obj, 'mode', None)}>"
         if isinstance(obj, dict):
             return {k: _json_safe(v) for k, v in obj.items()}
         if isinstance(obj, (list, tuple, set)):
@@ -317,6 +333,95 @@ def _wrap_diff_generator_generate() -> None:
 
     setattr(generate, _GEN_SENTINEL, True)
     DiffGenerator.generate = generate
+
+
+# ------------------------------------------------------------------ #
+# (7) InputValidationStage: call preprocess_condition_image when only
+#     condition_image (PIL) is set, no image_path
+# ------------------------------------------------------------------
+
+
+_IVL_SENTINEL = "_unirl_ivl_cond_img"
+
+
+def _wrap_input_validation_condition_image() -> None:
+    """AROUND-wrap ``InputValidationStage.forward`` to invoke
+    ``preprocess_condition_image`` when ``condition_image`` is set but
+    ``image_path`` is None.
+
+    Upstream's forward (input_validation.py:380-412) only calls
+    ``preprocess_condition_image`` (which sets ``batch.vae_image_sizes`` via
+    ``config.preprocess_vae_image``) inside the ``if batch.image_path is not
+    None`` branch. Edit-Plus ships the source image as a PIL via
+    ``condition_image`` with ``image_path=None``, so that branch is skipped
+    and ``vae_image_sizes`` stays None → ``_prepare_edit_cond_kwargs`` raises
+    ``TypeError: 'NoneType' object is not iterable``.
+
+    This wrap detects the PIL-only path and calls
+    ``preprocess_condition_image`` after upstream forward returns, using the
+    PIL's own width/height as the condition-image size (mirroring what
+    upstream would have done inside the image_path branch). No-op when
+    ``condition_image`` is None (T2I) or when ``image_path`` is set (upstream
+    already handled it). Idempotent.
+    """
+    try:
+        import sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation as ivl_mod
+    except ImportError:
+        return  # pragma: no cover - upstream module missing
+
+    IVL = getattr(ivl_mod, "InputValidationStage", None)
+    if IVL is None:
+        return  # pragma: no cover
+
+    orig_forward = IVL.__dict__.get("forward")
+    if orig_forward is None or getattr(orig_forward, _IVL_SENTINEL, False):
+        return
+
+    def forward(self, batch, server_args, __orig=orig_forward):
+        batch = __orig(self, batch, server_args)
+
+        # Only act on the PIL-only path: condition_image set, image_path None,
+        # and vae_image_sizes not yet populated (upstream didn't call
+        # preprocess_condition_image).
+        condition_image = getattr(batch, "condition_image", None)
+        image_path = getattr(batch, "image_path", None)
+        vae_image_sizes = getattr(batch, "vae_image_sizes", None)
+        if condition_image is None or image_path is not None or vae_image_sizes is not None:
+            return batch
+
+        # Mirror upstream's preprocess_condition_image entry (input_validation.py:131-165):
+        # it needs a single PIL to read width/height, and calls
+        # config.preprocess_vae_image(batch, self.vae_image_processor) which
+        # populates batch.vae_image_sizes.
+        img = condition_image[-1] if isinstance(condition_image, list) else condition_image
+        condition_image_width = img.width
+        condition_image_height = img.height
+        batch.original_condition_image_size = (condition_image_width, condition_image_height)
+
+        # Preserve the driver-pinned output dims. ``preprocess_condition_image``
+        # overwrites batch.height/width with the source-image-derived VAE size
+        # (~1024²) UNLESS ``extra["explicit_fields"]`` lists them. Upstream's
+        # ``_explicit_fields`` (set in ``from_user_sampling_params_args``) is a
+        # plain attribute that ``dataclasses.replace`` drops in
+        # ``DiffGenerator.generate``'s per-prompt loop, so for the PIL path
+        # (which skips the image_path branch that re-sets it) ``explicit_fields``
+        # is empty here and the user's 384² gets clobbered to 1024². The
+        # driver-authoritative ``initial_noise`` was created at 384², so a
+        # clobbered 1024² makes ``maybe_pack_latents`` reshape against the
+        # wrong grid → ``RuntimeError: shape '[1,16,64,2,64,2]' is invalid for
+        # input of size 36864``. UniRL's adapter always pins height/width
+        # (build_sampling), so save/restore them across the call.
+        saved_height = batch.height
+        saved_width = batch.width
+        self.preprocess_condition_image(
+            batch, server_args, condition_image_width, condition_image_height
+        )
+        batch.height = saved_height
+        batch.width = saved_width
+        return batch
+
+    setattr(forward, _IVL_SENTINEL, True)
+    IVL.forward = forward
 
 
 # ------------------------------------------------------------------ #
