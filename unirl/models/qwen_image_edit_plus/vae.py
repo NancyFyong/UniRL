@@ -15,6 +15,8 @@ the Edit-Plus package is self-contained.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from unirl.models.types.codec import EncodeStage
@@ -24,18 +26,48 @@ from unirl.types.primitives import Images
 from .bundle import QwenImageEditPlusBundle
 
 
+# Upstream ``QwenImageEditPlusPipelineConfig`` (sglang/diffusers) resizes the
+# source image to a fixed total pixel area of ``1024 * 1024`` while preserving
+# aspect ratio (see ``VAE_IMAGE_SIZE`` in
+# ``sglang/multimodal_gen/configs/pipeline_configs/qwen_image.py``). The
+# trainsite encoder MUST match this — using the generation grid (e.g. 384²)
+# instead yields a different ``image_latent`` shape than the sglang/vllm_omni
+# rollout engines, breaking the trainsite-vs-separate-engine parity contract
+# the recipe YAMLs promise. Mirrors upstream ``calculate_dimensions``.
+_VAE_IMAGE_AREA = 1024 * 1024
+_VAE_SIZE_ALIGN = 32  # upstream rounds to 32-pixel multiples
+
+
+def _vae_size_for_aspect(width: int, height: int) -> tuple[int, int]:
+    """Aspect-preserving resize target matching upstream ``VAE_IMAGE_SIZE``.
+
+    Returns ``(vae_width, vae_height)`` aligned to ``_VAE_SIZE_ALIGN`` with
+    total area ≈ ``_VAE_IMAGE_AREA``. Mirrors
+    ``sglang.multimodal_gen.utils.calculate_dimensions``.
+    """
+    ratio = float(width) / float(height)
+    vae_width = math.sqrt(_VAE_IMAGE_AREA * ratio)
+    vae_height = vae_width / ratio
+    vae_width = round(vae_width / _VAE_SIZE_ALIGN) * _VAE_SIZE_ALIGN
+    vae_height = round(vae_height / _VAE_SIZE_ALIGN) * _VAE_SIZE_ALIGN
+    return int(vae_width), int(vae_height)
+
+
 class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, ImageLatentCondition]):
     """Encode a source image into a VAE-latent condition for token concat.
 
     Pipeline:
 
-    1. Resize source pixels to the generation ``(height, width)``. The data
-       source loads condition images at native resolution (arbitrary H×W),
-       but the Qwen-Image VAE requires H, W divisible by 16 (8× VAE +
-       2× patch), and a consistent token count across a GRPO group needs
-       a fixed size. Using the generation size satisfies both (recipe
-       sizes are multiples of 16) and matches the edited-image resolution.
-       Mirrors ``flux2_klein/vae.py:125-135``.
+    1. Resize source pixels to the upstream ``VAE_IMAGE_SIZE`` grid
+       (≈1024², aspect-preserving, 32-aligned). The data source loads
+       condition images at native resolution (arbitrary H×W), but
+       upstream ``QwenImageEditPlusPipelineConfig.calculate_condition_image_size``
+       resizes to ``1024*1024`` total area for VAE encoding — the
+       trainsite MUST match so the emitted ``image_latent`` shape is
+       byte-identical to the sglang/vllm_omni rollout engines (the
+       recipe YAMLs promise fixed-seed parity). The generation grid
+       (e.g. 384²) is the *output* canvas size, NOT the source-image
+       VAE size; using it here was a parity-breaking bug.
     2. ``[0, 1] → [-1, 1]`` (VAE input convention).
     3. Lift to 5D ``[B, 3, 1, H, W]`` (Qwen-Image VAE is a video VAE —
        ``_encode`` unpacks ``_, _, num_frame, height, width = x.shape``;
@@ -67,11 +99,15 @@ class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, ImageLatentCondition])
             images: source ``Images`` with ``pixels`` ``[B, 3, H, W]`` in
                 ``[0, 1]``.
             height, width: generation grid (must be divisible by 16: 8× VAE
-                downsample + 2× patchify).
+                downsample + 2× patchify). Used only for the 16-alignment
+                guard; the source image is resized to the upstream
+                ``VAE_IMAGE_SIZE`` grid (≈1024²), NOT to the generation
+                grid, matching sglang/vllm_omni rollout engines.
 
         Returns:
             :class:`ImageLatentCondition` with ``latents`` shape
-            ``[B, 16, H/8, W/8]`` on the bundle device, in the bundle dtype.
+            ``[B, 16, H_vae/8, W_vae/8]`` on the bundle device, in the
+            bundle dtype.
         """
         pixels = images.pixels
         if pixels is None or pixels.ndim != 4 or pixels.shape[1] != 3:
@@ -92,9 +128,16 @@ class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, ImageLatentCondition])
         vae_f32 = vae.to(torch.float32)
 
         pixels = pixels.to(device=device, dtype=torch.float32)
-        if int(pixels.shape[-2]) != int(height) or int(pixels.shape[-1]) != int(width):
+        # Resize to the upstream VAE_IMAGE_SIZE grid (aspect-preserving,
+        # ≈1024²) — NOT to the generation (height, width). The generation
+        # grid is the output canvas; the source image VAE size is fixed by
+        # upstream protocol and shared with sglang/vllm_omni engines.
+        src_h = int(pixels.shape[-2])
+        src_w = int(pixels.shape[-1])
+        vae_w, vae_h = _vae_size_for_aspect(src_w, src_h)
+        if src_h != vae_h or src_w != vae_w:
             pixels = torch.nn.functional.interpolate(
-                pixels, size=(int(height), int(width)), mode="bilinear", align_corners=False
+                pixels, size=(vae_h, vae_w), mode="bilinear", align_corners=False
             )
 
         # [0, 1] → [-1, 1] (VAE input convention).
