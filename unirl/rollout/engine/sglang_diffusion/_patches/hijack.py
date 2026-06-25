@@ -77,6 +77,20 @@ class _DiffrlPatchedTarget:
         #     TORCH_NCCL_ENABLE_MONITORING=0 (verified against libtorch_cuda.so
         #     strings) fully disables the monitor thread; the monitor provides
         #     no value in a single-process (world_size=1) NCCL world.
+        #
+        # NOTE (torch 2.11): ``TORCH_NCCL_ENABLE_MONITORING`` does not exist in
+        # this build (the monitor has no disable flag; only
+        # ``TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC``). The monitor thread therefore
+        # always starts after ``init_process_group``. The remaining race is the
+        # monitor thread's glibc ``getenv`` vs ``os.environ[k]=v`` (``putenv``)
+        # during model load — e.g. ``lora_pipeline.py:33`` sets
+        # ``TOKENIZERS_PARALLELISM`` at *import* time, and the lora module is
+        # imported during model construction (after init_process_group).
+        # Pre-setting ``TOKENIZERS_PARALLELISM`` and pre-importing the lora
+        # pipeline module here (before the scheduler target runs, hence before
+        # ``init_process_group`` starts the monitor) eliminates the concurrent
+        # ``putenv``: by the time the monitor thread calls ``getenv``, no
+        # further ``putenv`` will fire.
         import os as _os
 
         for _k in (
@@ -91,7 +105,17 @@ class _DiffrlPatchedTarget:
         ):
             _os.environ.pop(_k, None)
 
-        _os.environ["TORCH_NCCL_ENABLE_MONITORING"] = "0"
+        # Pre-set the env vars that sglang's gpu_worker.py:126-130 and
+        # lora_pipeline.py:33 will (re)set later, so the later ``os.environ[k]=v``
+        # assignments are no-ops on the glibc ``environ`` array only if the value
+        # is unchanged — they still call ``putenv``. The robust guard is to
+        # pre-import lora_pipeline (triggering its module-level ``putenv`` for
+        # TOKENIZERS_PARALLELISM) HERE, before init_process_group.
+        _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        try:
+            import sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline as _lp  # noqa: F401
+        except Exception:
+            pass
 
         SglangDiffusionHijack.hijack()
         return self._target(*args, **kwargs)
