@@ -48,6 +48,51 @@ class _DiffrlPatchedTarget:
         self._target = target
 
     def __call__(self, *args, **kwargs):
+        # Two independent NCCL hazards in the sglang scheduler subprocess:
+        #
+        # (1) launch_server() deadlock — stale NCCL env vars inherited from the
+        #     Ray worker's train-side FSDP setup (Remote.setup writes them into
+        #     os.environ at remote.py:104). The scheduler subprocess is a fresh
+        #     single-process dist world (num_gpus=1), but it inherits
+        #     NCCL_TOPO_FILE pointing at a parent-process fd (/proc/self/fd/NNN)
+        #     that doesn't exist here → NCCL ``new_group`` →
+        #     ``eager_connect_single_device`` hangs on a dead pipe. The other
+        #     NCCL knobs (SOCKET_IFNAME, BUFFSIZE, ...) are train-mesh-specific
+        #     and have no correct value in this subprocess; let NCCL use
+        #     defaults. gpu_worker.init_device_and_model re-sets MASTER_ADDR/
+        #     MASTER_PORT/WORLD_SIZE/RANK before init_process_group, so those
+        #     are not cleared. This hang is nondeterministic across workers
+        #     (timing of NCCL topo detection), hence only some workers hit it.
+        #
+        # (2) HeartbeatMonitor SIGSEGV — after init_process_group succeeds, the
+        #     NCCL HeartbeatMonitor thread starts and calls glibc ``getenv``
+        #     (via DumpPipe::DumpPipe(int) → getCvarString) on a background
+        #     thread. glibc ``getenv`` is NOT thread-safe: sglang's model-load
+        #     path concurrently calls ``os.environ[k]=v`` (putenv, which may
+        #     realloc the environ array) — e.g. lora_pipeline.py:33 sets
+        #     TOKENIZERS_PARALLELISM at import, gpu_worker.py:126-130 sets
+        #     MASTER_ADDR/MASTER_PORT/... If the windows overlap →
+        #     use-after-free → SIGSEGV in getenv. This is also timing-dependent
+        #     (FlowGRPO 06-24 didn't hit it; NFT 06-25 did). Setting
+        #     TORCH_NCCL_ENABLE_MONITORING=0 (verified against libtorch_cuda.so
+        #     strings) fully disables the monitor thread; the monitor provides
+        #     no value in a single-process (world_size=1) NCCL world.
+        import os as _os
+
+        for _k in (
+            "NCCL_TOPO_FILE",
+            "NCCL_SOCKET_IFNAME",
+            "NCCL_BUFFSIZE",
+            "NCCL_NET_FORCE_FLUSH",
+            "NCCL_NVLSTREE_MAX_CHUNKSIZE",
+            "NCCL_NVLS_CHUNKSIZE",
+            "NCCL_P2P_NET_CHUNKSIZE",
+            "NCCL_TUNER_PLUGIN",
+        ):
+            _os.environ.pop(_k, None)
+
+        _os.environ["TORCH_NCCL_ENABLE_MONITORING"] = "0"
+
         SglangDiffusionHijack.hijack()
         return self._target(*args, **kwargs)
 
