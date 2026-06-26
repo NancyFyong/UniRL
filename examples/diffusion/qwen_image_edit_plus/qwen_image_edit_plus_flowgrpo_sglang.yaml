@@ -56,7 +56,7 @@ weight_sync_interval: 1       # LoRA sync cadence: every N rollouts push adapter
 save_interval: 5              # checkpoint every 5 rollouts
 save_dir: ${oc.env:SAVE_DIR,/efs/linyongpan/code/zyf/UniRL/outputs/checkpoints/flowgrpo_sglang}
 save_mode: auto               # LoRA-only when LoRA active, full otherwise
-eval_interval: 10             # evaluate on eval split every 10 rollouts
+eval_interval: 0              # disabled — eval path + FlowGRPO SDE noise recipe shape mismatch (TODO)
 
 # Shared nodes: model_config + strategy defined once, referenced by
 # bundle / pipeline / rollout (the sglang engine needs both at init).
@@ -188,13 +188,10 @@ rollout:
       # naming. Auto-detection via the "qwen-image-edit-2511" substring would
       # also work, but the explicit pin mirrors qwen_image_sglang.yaml.
       model_id: Qwen-Image-Edit-2511
-      # Colocate layout: trainer (~55GB) + rollout DiT (~39GB) per GPU → OOM on
-      # 96GB H20 without layer-wise CPU streaming. This streams DiT layers from
-      # CPU on demand so the resident GPU footprint stays ~few GB, not 38GB.
-      # The NFT sglang sibling omits this (its num_sde_steps=0 ODE path is
-      # lighter); FlowGRPO with num_sde_steps=3 + SDE noise injection is heavier,
-      # so we add it defensively. Drop if your GPUs have headroom (e.g. H100 80GB).
-      dit_layerwise_offload: true
+      # NFT sibling omits dit_layerwise_offload and runs stably on 8× H20 96GB
+      # (trainer ~55GB + rollout DiT ~39GB fits). dit_layerwise_offload caused
+      # a SIGSEGV (exit code -11) in sglang's local server launch on this setup,
+      # so we omit it too. Re-enable only if OOM is observed on smaller GPUs.
 
 reward:
   _target_: unirl.reward.service.RewardService
