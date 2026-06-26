@@ -126,19 +126,6 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
             prompt_embeds_mask = prompt_embeds_mask[:, :max_true]
         txt_seq_lens = true_lens.tolist()
 
-        import os as _os
-        if _os.environ.get("UNIRL_DEBUG_ROPE"):
-            import sys as _sys
-            print(
-                f"[ROPE-DBG] predict_noise: packed={tuple(packed.shape)} "
-                f"prompt_embeds={tuple(prompt_embeds.shape)} "
-                f"mask_sum={true_lens.tolist()} max_true={max_true} "
-                f"img_shapes={img_shapes[0]} latent_h={latent_h} latent_w={latent_w} "
-                f"has_image={has_image}",
-                file=_sys.stderr,
-                flush=True,
-            )
-
         noise_pred_packed = model.transformer(
             hidden_states=packed,
             timestep=timestep,

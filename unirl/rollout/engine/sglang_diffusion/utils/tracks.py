@@ -358,27 +358,12 @@ def fuse_text_conditions(
     neg_pooled_list: List[torch.Tensor] = []
     neg_mask_list: List[torch.Tensor] = []
 
-    import os as _os
-    _dbg = _os.environ.get("UNIRL_DEBUG_ROPE")
-    for _ri, result in enumerate(results):
+    for result in results:
         embeds = fuse_encoder_outputs(result.prompt_embeds)
         require(
             embeds is not None,
             "SGLang result missing prompt_embeds — request must pin return_prompt_embeds=True",
         )
-        if _dbg:
-            import sys as _sys
-            _raw = result.prompt_embeds
-            _raw_desc = (
-                f"list[len={len(_raw)}_shapes={[tuple(t.shape) for t in _raw]}]"
-                if isinstance(_raw, (list, tuple))
-                else f"tensor{tuple(_raw.shape)}"
-            )
-            print(
-                f"[ROPE-DBG] fuse_text_conditions result[{_ri}]: "
-                f"raw={_raw_desc} fused={tuple(embeds.shape)}",
-                file=_sys.stderr, flush=True,
-            )
         prompt_embeds_list.append(embeds.detach().cpu())
 
         pooled = fuse_encoder_outputs(result.pooled_prompt_embeds)
@@ -405,25 +390,6 @@ def fuse_text_conditions(
             neg_mask_list.append(neg_mask.detach().cpu())
 
     embeds_cat = _cat_padded_rows(prompt_embeds_list) if prompt_embeds_list else None
-    if _dbg and embeds_cat is not None:
-        import sys as _sys
-        _per = [tuple(e.shape) for e in prompt_embeds_list]
-        print(
-            f"[ROPE-DBG] fuse_text_conditions FINAL: per_result={_per} "
-            f"cat={tuple(embeds_cat.shape)}",
-            file=_sys.stderr, flush=True,
-        )
-
-    import os as _os
-    if _os.environ.get("UNIRL_DEBUG_ROPE") and embeds_cat is not None:
-        import sys as _sys
-        per_result_shapes = [tuple(t.shape) for t in prompt_embeds_list]
-        print(
-            f"[ROPE-DBG] fuse_text_conditions: n_results={len(prompt_embeds_list)} "
-            f"per_result_embeds_shapes={per_result_shapes} "
-            f"fused_embeds={tuple(embeds_cat.shape)}",
-            file=_sys.stderr, flush=True,
-        )
 
     text_cond = (
         TextEmbedCondition(
