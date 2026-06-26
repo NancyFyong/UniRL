@@ -337,26 +337,12 @@ def _copy_mapped_conditions(src, output_batch, mapping) -> None:
     ``_TOKEN_EMBED_DESTS``) keeps every downstream transform batch-first; a no-op
     for already-batched multi-encoder embeds (SD3/Qwen) and for pooled/masks.
     """
-    import os as _os
-    import torch as _torch
-    _dbg = _os.environ.get("UNIRL_DEBUG_ROPE")
     for dst, srcattr in mapping.items():
         val = _to_cpu_embed_list(getattr(src, srcattr, None))
         if dst in _TOKEN_EMBED_DESTS:
             val = _ensure_batched_embed_list(val)
             val = _coalesce_duplicate_single_sample_encodes(val)
         setattr(output_batch, dst, val)
-        if _dbg and val is not None:
-            import sys as _sys
-            if isinstance(val, (list, tuple)):
-                _s = [tuple(t.shape) if _torch.is_tensor(t) else type(t).__name__ for t in val]
-            else:
-                _s = tuple(val.shape) if _torch.is_tensor(val) else type(val).__name__
-            print(
-                f"[ROPE-DBG] _copy_mapped_conditions dst={dst} srcattr={srcattr} "
-                f"type={type(val).__name__} val={_s} id(src)={id(src)}",
-                file=_sys.stderr, flush=True,
-            )
 
 
 def _ensure_batched_embed_list(value):
@@ -519,31 +505,14 @@ def _merge_conditions(merged, output_batches) -> None:
     (None), the field is left None on ``merged`` -- positives are always present
     when ``return_prompt_embeds`` is set, negatives only under CFG.
     """
-    import os as _os
     import torch
 
-    _dbg = _os.environ.get("UNIRL_DEBUG_ROPE")
     for name in _COND_FIELDS:
         per_batch = [getattr(ob, name, None) for ob in output_batches]
         if any(v is None for v in per_batch):
             continue
         if not per_batch:
             continue
-        if _dbg:
-            import sys as _sys
-            _shapes = []
-            for v in per_batch[:3]:
-                if isinstance(v, (list, tuple)):
-                    _shapes.append([tuple(t.shape) if torch.is_tensor(t) else type(t).__name__ for t in v])
-                elif torch.is_tensor(v):
-                    _shapes.append(tuple(v.shape))
-                else:
-                    _shapes.append(type(v).__name__)
-            print(
-                f"[ROPE-DBG] _merge_conditions name={name} n_batches={len(per_batch)} "
-                f"per_batch[0:3]={_shapes} len(per_batch[0])={len(per_batch[0]) if isinstance(per_batch[0], (list, tuple)) else 'tensor'}",
-                file=_sys.stderr, flush=True,
-            )
         num_encoders = len(per_batch[0])
         # All batches must agree on encoder count to concat positionally.
         if any(len(v) != num_encoders for v in per_batch):
@@ -561,13 +530,6 @@ def _merge_conditions(merged, output_batches) -> None:
             else:
                 merged_list.append(torch.cat(tensors, dim=0))
         setattr(merged, name, merged_list)
-        if _dbg:
-            import sys as _sys
-            _mshapes = [tuple(t.shape) if torch.is_tensor(t) else type(t).__name__ for t in merged_list]
-            print(
-                f"[ROPE-DBG] _merge_conditions name={name} merged_list={_mshapes}",
-                file=_sys.stderr, flush=True,
-            )
 
 
 # ------------------------------------------------------------------ #

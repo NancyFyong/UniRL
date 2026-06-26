@@ -102,3 +102,7 @@ settings.json
 !.cursor/rules/**
 REFACTOR_LOG.md
 uv.lock
+
+# Scratch / agent-local state (never commit)
+.scratch/
+.codebuddy/
