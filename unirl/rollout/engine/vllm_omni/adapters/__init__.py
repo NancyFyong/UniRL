@@ -9,6 +9,7 @@ two conversion verbs):
 - ``hv15`` — hv15_t2v
 - ``qwen_image`` — qwen_image_t2i
 - ``qwen_image_edit_plus`` — qwen_image_edit_plus_t2i
+- ``bagel`` — bagel_t2i
 
 ``dit`` holds the universal single-stage DiT skeletons
 (:class:`DitInputAdapter` / :class:`DitOutputAdapter`) the families derive
@@ -16,6 +17,11 @@ from; family-specific sub-adapters carry the family prefix and live in the
 family file.
 """
 
+from unirl.rollout.engine.vllm_omni.adapters.bagel import (
+    BagelInputAdapter,
+    BagelOutputAdapter,
+    BagelT2iAdapter,
+)
 from unirl.rollout.engine.vllm_omni.adapters.base import (
     ModelAdapter,
     get_adapter,
@@ -57,6 +63,9 @@ from unirl.rollout.engine.vllm_omni.adapters.sd3 import Sd3OutputAdapter, Sd3T2i
 __all__ = [
     "DitInputAdapter",
     "DitOutputAdapter",
+    "BagelInputAdapter",
+    "BagelOutputAdapter",
+    "BagelT2iAdapter",
     "Hi3ArRecaptionAdapter",
     "Hi3ArRecaptionOutputAdapter",
     "Hi3DitRecaptionAdapter",
