@@ -53,6 +53,10 @@ batch_size: 48                # prompts_per_rollout
 adv_use_global_std: true      # advantage: divide by ONE batch-wide std (v1 parity), not per-group
 num_rollouts: 10000
 weight_sync_interval: 1       # LoRA sync cadence: every N rollouts push adapter into the engine
+save_interval: 5              # checkpoint every 5 rollouts
+save_dir: ${oc.env:SAVE_DIR,checkpoints/qwen_image_edit_plus_flowgrpo_sglang}
+save_mode: auto               # LoRA-only when LoRA active, full otherwise
+eval_interval: 10             # evaluate on eval split every 10 rollouts
 
 # Shared nodes: model_config + strategy defined once, referenced by
 # bundle / pipeline / rollout (the sglang engine needs both at init).
