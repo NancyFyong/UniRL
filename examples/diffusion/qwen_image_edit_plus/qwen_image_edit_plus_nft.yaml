@@ -1,6 +1,13 @@
 # @package _global_
 # Qwen-Image-Edit-Plus + DiffusionNFT trainside (FSDP) colocate, v2 trainer, 1x8.
 #
+# The parity oracle for qwen_image_edit_plus_nft_sglang.yaml — same
+# algorithm/bundle/sampling/conditions_cls/checkpoint cadence, byte-identical
+# except for the engine block (the sglang recipe adds weight_sync_interval +
+# sync block + load_text_encoder=false + tags; see its header for the delta
+# list). A fixed-seed run of this recipe vs the sglang one should compare
+# cleanly; any drift is rollout-engine numeric divergence, not config drift.
+#
 # DiffusionNFT = forward-process diffusion RL with a dual-adapter EMA reference:
 #   - backend.ema_lora_cfg installs the "default" (trainable) + "old" (EMA)
 #     LoRA pair via inject_nft; the trainer rolls out under "old" and trains
@@ -29,6 +36,12 @@ num_devices: 8
 batch_size: 48                # prompts_per_rollout
 adv_use_global_std: true      # advantage: divide by ONE batch-wide std (v1 parity), not per-group
 num_rollouts: 10000
+
+# Checkpoint cadence: write a checkpoint every N rollouts (and on the last).
+# 0 disables saving. The trainer reads this via cfg.get("save_interval", 0) in
+# unirl/train_diffusion.py; save_dir defaults to a repo-relative path.
+save_interval: 5
+save_dir: ${oc.env:SAVE_DIR,checkpoints/qwen_image_edit_plus_nft}
 
 bundle:
   _target_: unirl.models.qwen_image_edit_plus.bundle.QwenImageEditPlusBundle.from_config
@@ -60,7 +73,18 @@ backend:
     mixed_precision: true
     fsdp_mode: full
     reshard_after_forward: true
+    # Qwen-Image transformer + Qwen2.5-VL text encoder together exceed 96GB
+    # per H20 under full-graph replay without AC; v1 uses bf16_full_ac.
     activation_checkpointing: true
+    # Disabled: torch.compile + FSDP2 deadlocks on trainside. The same
+    # compiled transformer forward runs in TWO requires_grad contexts within
+    # one process — rollout under torch.no_grad() (engine.py:101) and NFT
+    # replay under grad (diffusionnft.py:325). Dynamo recompiles on the
+    # no_grad↔grad transition; ranks diverge in compile state across the
+    # rollout↔train boundary, so the FSDP2 post_backward reduce_scatter
+    # collective goes unmatched and NCCL hangs (~1800s watchdog abort).
+    # SGLang colocate is unaffected — rollout runs in a separate SGLang
+    # process, so the compiled FSDP forward only ever sees the grad path.
     use_torch_compile: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
@@ -141,12 +165,12 @@ algorithm:
   train_timestep_mode: all
   shuffle_train_timesteps: true
   apply_time_shift_in_loss: false
-  training_timestep_fraction: 0.99
+  training_timestep_fraction: 0.2
   kl_coef: 0.0
 
 stack:
   _target_: unirl.train.stack.TrainStack
-  micro_batch_size: 1
+  micro_batch_size: 2
   max_grad_norm: 1.0
 
 data_source:

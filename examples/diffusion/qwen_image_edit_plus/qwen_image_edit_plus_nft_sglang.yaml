@@ -40,6 +40,12 @@ adv_use_global_std: true      # advantage: divide by ONE batch-wide std (v1 pari
 num_rollouts: 10000
 weight_sync_interval: 1       # LoRA sync cadence: every N rollouts push adapter into the engine
 
+# Checkpoint cadence: write a checkpoint every N rollouts (and on the last).
+# 0 disables saving. The trainer reads this via cfg.get("save_interval", 0) in
+# unirl/train_diffusion.py; save_dir defaults to a repo-relative path.
+save_interval: 5
+save_dir: ${oc.env:SAVE_DIR,checkpoints/qwen_image_edit_plus_nft_sglang}
+
 # Shared nodes: model_config + strategy defined once, referenced by
 # bundle / pipeline / rollout (the sglang engine needs both at init).
 model_config:
