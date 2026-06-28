@@ -50,7 +50,7 @@
 
 num_devices: 8
 batch_size: 48                # prompts_per_rollout
-adv_use_global_std: true      # advantage: divide by ONE batch-wide std (v1 parity), not per-group
+adv_use_global_std: false     # per-group GRPO normalization (bagel/mainline default); global std shrinks advantages 2-5x
 num_rollouts: 10000
 weight_sync_interval: 1       # LoRA sync cadence: every N rollouts push adapter into the engine
 save_interval: 5              # checkpoint every 5 rollouts
