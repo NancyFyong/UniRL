@@ -25,7 +25,6 @@ from unirl.types.primitives import Images
 
 from .bundle import QwenImageEditPlusBundle
 
-
 # Upstream ``QwenImageEditPlusPipelineConfig`` (sglang/diffusers) resizes the
 # source image to a fixed total pixel area of ``1024 * 1024`` while preserving
 # aspect ratio (see ``VAE_IMAGE_SIZE`` in
@@ -136,9 +135,7 @@ class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, ImageLatentCondition])
         src_w = int(pixels.shape[-1])
         vae_w, vae_h = _vae_size_for_aspect(src_w, src_h)
         if src_h != vae_h or src_w != vae_w:
-            pixels = torch.nn.functional.interpolate(
-                pixels, size=(vae_h, vae_w), mode="bilinear", align_corners=False
-            )
+            pixels = torch.nn.functional.interpolate(pixels, size=(vae_h, vae_w), mode="bilinear", align_corners=False)
 
         # [0, 1] → [-1, 1] (VAE input convention).
         scaled = pixels * 2.0 - 1.0
