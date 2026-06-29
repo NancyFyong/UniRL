@@ -413,9 +413,7 @@ def _wrap_input_validation_condition_image() -> None:
         # (build_sampling), so save/restore them across the call.
         saved_height = batch.height
         saved_width = batch.width
-        self.preprocess_condition_image(
-            batch, server_args, condition_image_width, condition_image_height
-        )
+        self.preprocess_condition_image(batch, server_args, condition_image_width, condition_image_height)
         batch.height = saved_height
         batch.width = saved_width
         return batch
