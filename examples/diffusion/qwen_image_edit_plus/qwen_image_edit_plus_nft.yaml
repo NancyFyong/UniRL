@@ -42,6 +42,9 @@ num_rollouts: 10000
 # unirl/train_diffusion.py; save_dir defaults to a repo-relative path.
 save_interval: 5
 save_dir: ${oc.env:SAVE_DIR,checkpoints/qwen_image_edit_plus_nft}
+# Resume from the latest checkpoint (trainer reads cfg.get("load_dir")).
+# Points at checkpoint-60 written 2026-06-28 11:05 before the prior run OOM'd.
+load_dir: ${oc.env:LOAD_DIR,checkpoints/qwen_image_edit_plus_nft/checkpoint-60}
 
 bundle:
   _target_: unirl.models.qwen_image_edit_plus.bundle.QwenImageEditPlusBundle.from_config
@@ -72,7 +75,7 @@ backend:
     cpu_offload: false
     mixed_precision: true
     fsdp_mode: full
-    reshard_after_forward: true
+    reshard_after_forward: false  # ZeRO-2: keep params unsharded across forward → fewer all-gathers (faster rollout at forward_batch_size=8)
     # Qwen-Image transformer + Qwen2.5-VL text encoder together exceed 96GB
     # per H20 under full-graph replay without AC; v1 uses bf16_full_ac.
     activation_checkpointing: true
@@ -134,9 +137,10 @@ backend:
 rollout:
   _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
   stage_attrs: [diffusion]
-  # Mirrors v1 rollout.plan.forward_batch_size: 1 (Qwen-Image VAE + text
-  # encoder are heavy; chunk forward to 1 sample at a time).
-  forward_batch_size: 1
+  # forward_batch_size=8: process 8 samples per rank per forward (H200 143GB
+  # allows it; reshard_after_forward=false keeps params unsharded so repeated
+  # forwards skip the all-gather). Was 1 — 8x fewer forward calls per rollout.
+  forward_batch_size: 8
 
 reward:
   _target_: unirl.reward.service.RewardService
