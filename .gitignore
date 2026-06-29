@@ -105,7 +105,3 @@ uv.lock
 
 # Re-assert bytecode ignore after the force-includes above (last match wins)
 __pycache__/
-
-# Scratch / agent-local state (never commit)
-.scratch/
-.codebuddy/
