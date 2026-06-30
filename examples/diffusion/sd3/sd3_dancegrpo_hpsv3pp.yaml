@@ -101,10 +101,12 @@ reward:
       # RL-iteration condition in [0, 1]; 0.0 = pre-RL preference scoring. The
       # paper ramps 0.3 -> 1.0 over RL training (per-step ramp needs step plumbing).
       rl_iteration: 0.0
-      # Reward is divided by score_scale (raw mu is ~7-11). 15.0 matches the
-      # hpsv3 scorer's /15.0, landing this in ~0-1 like the PickScore baseline
-      # these (otherwise unchanged) hyperparams — esp. clip_range 1e-4 — assume.
-      score_scale: 15.0
+      # score_scale is a divisor on the raw mu (reward = mu / score_scale).
+      # GRPO normalizes advantages by (reward - mean)/std, so the scale cancels
+      # and training is invariant to this value — 1.0 keeps the raw HPSv3++ mu
+      # (~7-11), which is directly comparable to the scores reported in the
+      # paper / HPSv3 benchmark. Set it only to rescale what wandb logs.
+      score_scale: 1.0
 
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO
