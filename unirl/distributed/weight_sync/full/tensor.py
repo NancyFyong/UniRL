@@ -64,11 +64,23 @@ class TensorWeightSync(FullWeightSync):
         """
         import torch
 
-        from unirl.distributed.weight_sync.transfer.sgl_compat import (
-            FlattenedTensorBucket,
-            MultiprocessingSerializer,
-            monkey_patch_torch_reductions,
-        )
+        # Use SGLang's own reductions when available so pickles reference
+        # ``sglang.srt.utils.patch_torch._rebuild_cuda_tensor_modified`` — the
+        # server-side ``SafeUnpickler`` allows ``sglang.srt.utils.`` but NOT
+        # ``unirl.``, so the vendored copy in ``sgl_compat`` only works for
+        # vLLM-Omni (where the receiver is a vLLM worker, not SGLang's
+        # SafeUnpickler). Fall back to the vendored copy for vLLM-Omni envs
+        # that don't install sglang.
+        try:
+            from sglang.srt.utils import MultiprocessingSerializer
+            from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+            from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+        except ImportError:
+            from unirl.distributed.weight_sync.transfer.sgl_compat import (
+                FlattenedTensorBucket,
+                MultiprocessingSerializer,
+                monkey_patch_torch_reductions,
+            )
 
         monkey_patch_torch_reductions()
 

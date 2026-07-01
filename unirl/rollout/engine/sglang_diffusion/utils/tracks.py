@@ -313,18 +313,31 @@ def _aligned_mask(mask_list: List[torch.Tensor], embeds_cat: Optional[torch.Tens
     dropped (SD3's ``predict_noise`` ignores the mask — dropping a mismatched mask
     is the safe, correct result and avoids padding the embeds up to a spurious
     length, the historic ~68x LoRA-gradient dilution).
+
+    For Qwen-Image-Edit-Plus the text encoder emits prompt_embeds that include
+    image-placeholder tokens (longer than the text-only attention mask). The
+    extra positions are all valid (image tokens the DiT attends to), so pad the
+    mask with ones up to the embeds seq-len instead of dropping it.
     """
     if not mask_list or embeds_cat is None:
         return None
     mask_cat = _cat_padded_rows(mask_list)
-    if int(mask_cat.shape[1]) != int(embeds_cat.shape[1]):
+    mask_seq = int(mask_cat.shape[1])
+    embeds_seq = int(embeds_cat.shape[1])
+    if mask_seq == embeds_seq:
+        return mask_cat
+    if mask_seq > embeds_seq:
         logger.debug(
             "Dropping attention mask: fused seq-len %d != embeds seq-len %d (mask not embeds-aligned for this family).",
-            int(mask_cat.shape[1]),
-            int(embeds_cat.shape[1]),
+            mask_seq,
+            embeds_seq,
         )
         return None
-    return mask_cat
+    # mask_seq < embeds_seq: pad with ones (image/placeholder tokens are valid).
+    # Edit-Plus prompt_embeds carry image-token slots beyond the text mask.
+    batch = mask_cat.shape[0]
+    pad = torch.ones((batch, embeds_seq - mask_seq), dtype=mask_cat.dtype, device=mask_cat.device)
+    return torch.cat([mask_cat, pad], dim=1)
 
 
 def fuse_text_conditions(
@@ -377,6 +390,7 @@ def fuse_text_conditions(
             neg_mask_list.append(neg_mask.detach().cpu())
 
     embeds_cat = _cat_padded_rows(prompt_embeds_list) if prompt_embeds_list else None
+
     text_cond = (
         TextEmbedCondition(
             embeds=embeds_cat,
