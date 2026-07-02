@@ -310,7 +310,7 @@ def _wrap_diff_generator_generate() -> None:
     if getattr(orig, _GEN_SENTINEL, False):
         return
 
-    def generate(self, sampling_params_kwargs=None, *args, **kwargs, __orig=orig):
+    def generate(self, sampling_params_kwargs=None, *args, **kwargs):
         # Stash the per-prompt condition_image list BEFORE the per-prompt loop
         # so _wrap_prepare_request can index it. Reset the counter regardless
         # so a leftover stash from a prior call can't corrupt this one.
@@ -324,7 +324,7 @@ def _wrap_diff_generator_generate() -> None:
             _local.condition_image_per_prompt = None
             _local.condition_image_idx = 0
         try:
-            return __orig(self, sampling_params_kwargs, *args, **kwargs)
+            return orig(self, sampling_params_kwargs, *args, **kwargs)
         finally:
             # Always clear so a later T2I call in the same thread can't pick
             # up a stale Edit-Plus stash.
