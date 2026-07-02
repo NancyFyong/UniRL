@@ -92,17 +92,17 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
 
         # --- Source-image latent concat (Edit-Plus extension) -------------
         image_latent_cond = conditions.image_latent
-        has_image = image_latent_cond is not None and image_latent_cond.latents is not None
-        if has_image:
-            image_latents = image_latent_cond.latents.to(device=device, dtype=dtype)
-            img_latent_h = int(image_latents.shape[-2])
-            img_latent_w = int(image_latents.shape[-1])
-            image_packed = _pack_latents(image_latents)  # [B, (ih/2)*(iw/2), C*4]
-            packed = torch.cat([packed, image_packed], dim=1)
-            img_shapes = [[(1, latent_h // 2, latent_w // 2), (1, img_latent_h // 2, img_latent_w // 2)]] * batch_size
-        else:
-            # T2I degenerate path (no source image) — base Qwen-Image behavior.
-            img_shapes = [[(1, latent_h // 2, latent_w // 2)]] * batch_size
+        if image_latent_cond is None or image_latent_cond.latents is None:
+            raise ValueError(
+                "QwenImageEditPlusDiffusionStep.predict_noise: conditions.image_latent is None. "
+                "Edit-Plus is edit-only and requires a source image."
+            )
+        image_latents = image_latent_cond.latents.to(device=device, dtype=dtype)
+        img_latent_h = int(image_latents.shape[-2])
+        img_latent_w = int(image_latents.shape[-1])
+        image_packed = _pack_latents(image_latents)  # [B, (ih/2)*(iw/2), C*4]
+        packed = torch.cat([packed, image_packed], dim=1)
+        img_shapes = [[(1, latent_h // 2, latent_w // 2), (1, img_latent_h // 2, img_latent_w // 2)]] * batch_size
 
         # Qwen-Image's transformer takes raw sigma as the timestep input.
         if sigma.dim() == 0:

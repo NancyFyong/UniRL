@@ -64,6 +64,10 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
     ``latents``), so the T2I unpack is correct.
     """
 
+    #: Edit-Plus text embeds carry image-placeholder tokens beyond the text
+    #: mask, so the mask must be padded (not dropped) to match embeds length.
+    pad_mask_to_embeds = True
+
     def build_prompts(self, req: RolloutReq) -> Dict[str, Any]:
         """Inject source-image PIL via ``condition_image`` sampling kwarg.
 
