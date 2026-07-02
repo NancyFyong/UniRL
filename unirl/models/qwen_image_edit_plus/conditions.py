@@ -1,17 +1,17 @@
 """QwenImageEditPlusConditions — typed conditions for Qwen-Image-Edit-Plus.
 
-Extends :class:`unirl.models.qwen_image.QwenImageConditions` with one slot:
-``image_latent: ImageLatentCondition`` carrying the VAE-encoded source
-image. The diffusion step packs it (2×2 channel-pack, same as the noise
-latent) and concatenates along the token dimension before the transformer
-call, then slices the prediction back to the noise segment — mirrors
-``vde_editplus.py:232,246`` and the FLUX.2-Klein image-edit pattern
-(``flux2_klein/diffusion.py:160-183``).
+Mirrors :class:`unirl.models.qwen_image.QwenImageConditions` (same ``text`` +
+``negative_text`` slots) and adds one slot: ``image_latent: ImageLatentCondition``
+carrying the VAE-encoded source image. The diffusion step packs it (2×2
+channel-pack, same as the noise latent) and concatenates along the token
+dimension before the transformer call, then slices the prediction back to the
+noise segment — mirrors ``vde_editplus.py:232,246`` and the FLUX.2-Klein
+image-edit pattern (``flux2_klein/diffusion.py:160-183``).
 
-``image_latent`` is optional so the conditions container round-trips
-cleanly for the T2I degenerate path (no source image); the Edit-Plus
-pipeline itself requires a source image and raises at ``generate(req)``
-time if absent (fail-fast, constraint #27).
+``image_latent`` is optional so the conditions container round-trips cleanly
+for the T2I degenerate path (no source image); the Edit-Plus pipeline itself
+requires a source image and raises at ``generate(req)`` time if absent
+(fail-fast, constraint #27).
 """
 
 from __future__ import annotations

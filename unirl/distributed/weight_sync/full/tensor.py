@@ -64,18 +64,24 @@ class TensorWeightSync(FullWeightSync):
         """
         import torch
 
-        # Use SGLang's own reductions when available so pickles reference
-        # ``sglang.srt.utils.patch_torch._rebuild_cuda_tensor_modified`` — the
-        # server-side ``SafeUnpickler`` allows ``sglang.srt.utils.`` but NOT
+        # Use SGLang's own reductions when the rollout engine is SGLang-based
+        # so pickles reference ``sglang.srt.utils.patch_torch._rebuild_cuda_tensor_modified``
+        # — the server-side ``SafeUnpickler`` allows ``sglang.srt.utils.`` but NOT
         # ``unirl.``, so the vendored copy in ``sgl_compat`` only works for
         # vLLM-Omni (where the receiver is a vLLM worker, not SGLang's
-        # SafeUnpickler). Fall back to the vendored copy for vLLM-Omni envs
-        # that don't install sglang.
-        try:
-            from sglang.srt.utils import MultiprocessingSerializer
-            from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
-            from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
-        except ImportError:
+        # SafeUnpickler). When both sglang and vllm are installed, detect the
+        # engine kind from the rollout sibling so vLLM-Omni doesn't accidentally
+        # use SGLang's reductions.
+        rollout_mod = type(self._rollout).__module__
+        use_sglang = "sglang" in rollout_mod and "vllm" not in rollout_mod
+        if use_sglang:
+            try:
+                from sglang.srt.utils import MultiprocessingSerializer
+                from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+                from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+            except ImportError:
+                use_sglang = False
+        if not use_sglang:
             from unirl.distributed.weight_sync.transfer.sgl_compat import (
                 FlattenedTensorBucket,
                 MultiprocessingSerializer,

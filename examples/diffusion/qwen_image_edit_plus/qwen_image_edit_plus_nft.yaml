@@ -43,8 +43,8 @@ num_rollouts: 10000
 save_interval: 5
 save_dir: ${oc.env:SAVE_DIR,checkpoints/qwen_image_edit_plus_nft}
 # Resume from the latest checkpoint (trainer reads cfg.get("load_dir")).
-# Points at checkpoint-60 written 2026-06-28 11:05 before the prior run OOM'd.
-load_dir: ${oc.env:LOAD_DIR,checkpoints/qwen_image_edit_plus_nft/checkpoint-60}
+# Leave unset to start fresh; set LOAD_DIR to a checkpoint dir to resume.
+load_dir: ${oc.env:LOAD_DIR,}
 
 bundle:
   _target_: unirl.models.qwen_image_edit_plus.bundle.QwenImageEditPlusBundle.from_config
