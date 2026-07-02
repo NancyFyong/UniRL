@@ -222,6 +222,9 @@ class SglangDiffusionHijack:
         from unirl.rollout.engine.sglang_diffusion._patches.patch_rollout_trajectory import (
             patch_rollout_trajectory,
         )
+        from unirl.rollout.engine.sglang_diffusion._patches.patch_safe_unpickler import (
+            patch_safe_unpickler,
+        )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_sampling_io import (
             patch_sampling_io,
         )
@@ -267,5 +270,6 @@ class SglangDiffusionHijack:
             patch_dance,
             patch_set_timesteps,
             patch_vae_decode_safe,
+            patch_safe_unpickler,
         ):
             _safe_apply(patch)
