@@ -93,17 +93,28 @@ class _DiffrlPatchedTarget:
         # further ``putenv`` will fire.
         import os as _os
 
-        for _k in (
-            "NCCL_TOPO_FILE",
-            "NCCL_SOCKET_IFNAME",
-            "NCCL_BUFFSIZE",
-            "NCCL_NET_FORCE_FLUSH",
-            "NCCL_NVLSTREE_MAX_CHUNKSIZE",
-            "NCCL_NVLS_CHUNKSIZE",
-            "NCCL_P2P_NET_CHUNKSIZE",
-            "NCCL_TUNER_PLUGIN",
-        ):
-            _os.environ.pop(_k, None)
+        # PRECONDITION: this scrub assumes the scheduler subprocess hosts a
+        # single-process NCCL world (num_gpus=1 / tp_size=1 — the only
+        # validated colocate topology). Deployments that need these knobs
+        # inside the subprocess (engine TP>1, multi-NIC hosts pinning
+        # NCCL_SOCKET_IFNAME) can set UNIRL_SGLANG_KEEP_NCCL_ENV=1 to skip it.
+        if _os.environ.get("UNIRL_SGLANG_KEEP_NCCL_ENV") not in ("1", "true"):
+            # NCCL_TOPO_FILE is the actual deadlock trigger, but only when it
+            # dangles (a /proc/self/fd/NNN path of the dead parent). A real,
+            # readable topo file is a legitimate host-level setting — keep it.
+            _topo = _os.environ.get("NCCL_TOPO_FILE")
+            if _topo is not None and not _os.path.exists(_topo):
+                _os.environ.pop("NCCL_TOPO_FILE", None)
+            for _k in (
+                "NCCL_SOCKET_IFNAME",
+                "NCCL_BUFFSIZE",
+                "NCCL_NET_FORCE_FLUSH",
+                "NCCL_NVLSTREE_MAX_CHUNKSIZE",
+                "NCCL_NVLS_CHUNKSIZE",
+                "NCCL_P2P_NET_CHUNKSIZE",
+                "NCCL_TUNER_PLUGIN",
+            ):
+                _os.environ.pop(_k, None)
 
         # Pre-set the env vars that sglang's gpu_worker.py:126-130 and
         # lora_pipeline.py:33 will (re)set later, so the later ``os.environ[k]=v``

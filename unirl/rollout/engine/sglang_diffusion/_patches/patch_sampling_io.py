@@ -220,9 +220,15 @@ def _install_json_safe_tensor_guard(sp_mod) -> None:
 # ------------------------------------------------------------------
 
 
+#: Stand-in image_path used only for the duration of the wrapped validation
+#: call — never persisted, never dereferenced (upstream 0.5.12.post1 only
+#: None-checks image_path inside _validate_with_pipeline_config).
+_CONDITION_IMAGE_PATH_SENTINEL = "<unirl:condition_image>"
+
+
 def _wrap_validate_with_pipeline_config(SamplingParams) -> None:
-    """AROUND-wrap ``_validate_with_pipeline_config`` to skip the I2I
-    ``image_path`` requirement when ``condition_image`` is populated.
+    """AROUND-wrap ``_validate_with_pipeline_config`` to let ``condition_image``
+    satisfy the I2I ``image_path`` requirement.
 
     Edit-Plus ships the source-image PIL via the ``condition_image`` field (a
     Req dataclass field, populated by ``_wrap_prepare_request``), NOT via
@@ -232,9 +238,18 @@ def _wrap_validate_with_pipeline_config(SamplingParams) -> None:
     (which checks ``batch.condition_image is not None`` BEFORE ``image_path``,
     so the PIL path is correct once validation passes).
 
-    The wrap is a pure superset: when ``condition_image`` is None (T2I, or
-    Edit-Plus calls that genuinely use ``image_path``), the original validation
-    runs unchanged. Idempotent.
+    Instead of re-implementing upstream's checks (which would silently skip
+    any validation a future sglang adds to this method), the wrap runs the
+    FULL original validation with ``image_path`` temporarily stubbed to a
+    sentinel string. Upstream 0.5.12.post1 only None-checks ``image_path``
+    here, so the sentinel (a) satisfies ``requires_image_input()`` — the
+    intended bypass — and (b) keeps the ``accepts_image_input()`` reject path
+    live: a T2I-only task type given a ``condition_image`` now fails
+    validation instead of silently ignoring the image. The sentinel is
+    restored in ``finally`` and never escapes the call.
+
+    When ``condition_image`` is None (T2I) or ``image_path`` is genuinely set,
+    the original validation runs untouched. Idempotent.
     """
     orig = SamplingParams.__dict__.get("_validate_with_pipeline_config")
     if orig is None:
@@ -243,21 +258,14 @@ def _wrap_validate_with_pipeline_config(SamplingParams) -> None:
         return
 
     def _validate_with_pipeline_config(self, pipeline_config, __orig=orig):
-        # Edit-Plus path: condition_image carries the PIL, so the image_path
-        # requirement is moot. Skip ONLY the image_path-None check; defer
-        # everything else (including the accepts_image_input() reject path)
-        # to the original.
         condition_image = getattr(self, "condition_image", None)
-        if condition_image is None:
+        if condition_image is None or getattr(self, "image_path", None) is not None:
             return __orig(self, pipeline_config)
-
-        # Mirror upstream's logic but skip the image_path-None raise when
-        # condition_image is set. The accepts_image_input() reject path still
-        # fires for task types that don't accept image input at all.
-        if not pipeline_config.task_type.accepts_image_input():
-            if getattr(self, "image_path", None) is not None:
-                raise ValueError(f"input_reference is not supported for {pipeline_config.task_type.name} models.")
-        # I2I requires_image_input() is satisfied by condition_image; skip.
+        self.image_path = _CONDITION_IMAGE_PATH_SENTINEL
+        try:
+            return __orig(self, pipeline_config)
+        finally:
+            self.image_path = None
 
     setattr(_validate_with_pipeline_config, _VALIDATE_SENTINEL, True)
     SamplingParams._validate_with_pipeline_config = _validate_with_pipeline_config

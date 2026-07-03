@@ -21,27 +21,12 @@ from typing import Any, Dict, List, Optional
 
 from unirl.config.validation import validate_precision_type
 
-
-def _qwen_image_edit_plus_dynamic_overrides() -> Dict[str, Any]:
-    """Canonical dynamic-shift params for Qwen-Image-Edit-Plus.
-
-    Identical to base Qwen-Image (same VAE scale factor 8, patch size 2,
-    and ``scheduler/scheduler_config.json`` shape). See
-    :func:`unirl.models.qwen_image._qwen_image_dynamic_overrides` for the
-    field semantics. The shift is derived from the **noise** latent's
-    ``image_seq_len`` (boundary condition #3 in the plan): the source-image
-    concat happens inside ``predict_noise`` after the schedule is fixed.
-    """
-    return {
-        "base_shift": 0.5,
-        "max_shift": 0.9,
-        "base_image_seq_len": 256,
-        "max_image_seq_len": 8192,
-        "time_shift_type": "exponential",
-        "shift_terminal": 0.02,
-        "vae_scale_factor": 8,
-        "patch_size": 2,
-    }
+# Edit-Plus shares base Qwen-Image's canonical dynamic-shift params verbatim
+# (same VAE scale factor 8, patch size 2, scheduler_config.json shape); the
+# shift is derived from the noise latent's ``image_seq_len`` only — the
+# source-image concat happens inside ``predict_noise`` after the schedule is
+# fixed. ``pipeline.build_schedule_policy`` uses the same function.
+from unirl.models.qwen_image.config import _qwen_image_dynamic_overrides
 
 
 @dataclass
@@ -80,7 +65,7 @@ class QwenImageEditPlusPipelineConfig:
     meta_init_transformer: bool = False
 
     use_dynamic_shifting: bool = True
-    dynamic_shift_overrides: Dict[str, Any] = field(default_factory=_qwen_image_edit_plus_dynamic_overrides)
+    dynamic_shift_overrides: Dict[str, Any] = field(default_factory=_qwen_image_dynamic_overrides)
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="QwenImageEditPlusPipelineConfig.model_precision")

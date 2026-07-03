@@ -16,33 +16,17 @@ from __future__ import annotations
 
 from unirl.models.qwen_image.bundle import QwenImageBundle
 
-from .config import QwenImageEditPlusPipelineConfig
-
 
 class QwenImageEditPlusBundle(QwenImageBundle):
     """Qwen-Image-Edit-Plus bundle: transformer (in_channels=64) + VAE +
     Qwen-VL text encoder + scheduler.
 
     Inherits :meth:`from_config` / :meth:`_from_config_locked` from
-    :class:`QwenImageBundle` unchanged. The config type annotation widens
-    to :class:`QwenImageEditPlusPipelineConfig` for documentation; the
-    runtime fields are identical, so the inherited ``from_config`` body
-    reads them without modification.
+    :class:`QwenImageBundle` unchanged —
+    :class:`~unirl.models.qwen_image_edit_plus.config.QwenImageEditPlusPipelineConfig`
+    is field-for-field compatible with the base config, and the inherited
+    classmethod already constructs ``cls`` (the subclass) instances.
     """
-
-    @classmethod
-    def from_config(cls, config: QwenImageEditPlusPipelineConfig) -> "QwenImageEditPlusBundle":
-        """Load all Edit-Plus components from a HuggingFace-layout checkpoint.
-
-        Delegates to :meth:`QwenImageBundle.from_config` — the Edit-Plus
-        checkpoint is structurally identical to base Qwen-Image; only the
-        transformer's input projection width differs, and that is read
-        from ``transformer/config.json`` by diffusers automatically.
-        """
-        # ``QwenImageBundle.from_config`` reads only attributes that exist
-        # on ``QwenImageEditPlusPipelineConfig`` (field-for-field compatible),
-        # so the upcast is safe.
-        return super().from_config(config)  # type: ignore[return-value]
 
 
 __all__ = ["QwenImageEditPlusBundle"]

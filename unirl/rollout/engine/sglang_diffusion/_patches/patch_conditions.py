@@ -317,8 +317,7 @@ def _copy_conditions(src, output_batch) -> None:
         if torch.is_tensor(image_latent):
             output_batch.image_latent = [image_latent.detach().cpu()]
         elif isinstance(image_latent, (list, tuple)):
-            moved = [t.detach().cpu() if torch.is_tensor(t) else t for t in image_latent]
-            output_batch.image_latent = moved if isinstance(image_latent, list) else list(moved)
+            output_batch.image_latent = [t.detach().cpu() if torch.is_tensor(t) else t for t in image_latent]
     # Edit-Plus vae_image_sizes: list[tuple[int, int]] of pixel (W, H) pairs
     # from upstream's preprocess_vae_image. The adapter needs these to unpack
     # image_latent to spatial form. Wrapped as [value] for the merge/slice path.
