@@ -1,11 +1,3 @@
-# Copyright 2026 Jayce-Ping
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
 """Qwen3.5 VL AR pipeline: text (+ images) in, text out.
 
 Combines :class:`Qwen3_5ChatTemplateStage` (chat template + image preprocessing)
