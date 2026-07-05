@@ -201,22 +201,32 @@ def _vision_rope_positions(
     image_grid_thw: Optional[torch.Tensor],
     video_grid_thw: Optional[torch.Tensor],
     attention_mask: torch.Tensor,
+    mm_token_type_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Call Qwen3.5 ``get_rope_index`` → ``[3, bs, seq]`` (t, h, w).
 
     Qwen3.5 makes ``mm_token_type_ids`` a REQUIRED positional arg
-    (unlike Qwen2.5-VL where it was optional). Build it from the config token
-    ids: text=0, image=1, video=2.
+    (unlike Qwen2.5-VL where it was optional). If not supplied, build it from
+    the config token ids: text=0, image=1, video=2.
+
+    ``mm_token_type_ids`` should be built from the **prompt** portion only —
+    response tokens must be text (0). Building it from ``input_ids`` directly
+    is unsafe when ``input_ids`` contains sampled response tokens that happen
+    to equal ``image_token_id`` / ``video_token_id``, which would create
+    phantom image/video groups and exhaust the ``grid_thw`` iterator inside
+    ``get_rope_index`` (cf. ms-swift's collator, which builds it per-sample on
+    the prompt before batching).
     """
     get_rope_index = transformer.model.get_rope_index
     cfg = transformer.config
-    mm_token_type_ids = torch.zeros_like(input_ids)
-    image_token_id = getattr(cfg, "image_token_id", None)
-    video_token_id = getattr(cfg, "video_token_id", None)
-    if image_token_id is not None:
-        mm_token_type_ids[input_ids == image_token_id] = 1
-    if video_token_id is not None:
-        mm_token_type_ids[input_ids == video_token_id] = 2
+    if mm_token_type_ids is None:
+        mm_token_type_ids = torch.zeros_like(input_ids)
+        image_token_id = getattr(cfg, "image_token_id", None)
+        video_token_id = getattr(cfg, "video_token_id", None)
+        if image_token_id is not None:
+            mm_token_type_ids[input_ids == image_token_id] = 1
+        if video_token_id is not None:
+            mm_token_type_ids[input_ids == video_token_id] = 2
     position_ids, _ = get_rope_index(
         input_ids,
         mm_token_type_ids,
@@ -452,6 +462,37 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
             full_ids = prompt_ids
             full_mask = prompt_mask
 
+        # Response tokens are sampled text — but a sampled id may happen to equal
+        # image_token_id / video_token_id. The model's get_placeholder_mask
+        # counts image tokens from input_ids directly (not mm_token_type_ids),
+        # so any stray image_token_id in the response would make the count exceed
+        # the actual image features → "Image features and image tokens do not
+        # match". Replace any such collisions in the response portion with pad_id.
+        cfg = self.model.transformer.config
+        _resp_image_token_id = getattr(cfg, "image_token_id", None)
+        _resp_video_token_id = getattr(cfg, "video_token_id", None)
+        if T_max > 0 and (_resp_image_token_id is not None or _resp_video_token_id is not None):
+            _resp_slice = full_ids[:, max_real_len:]
+            if _resp_image_token_id is not None:
+                _resp_slice[_resp_slice == _resp_image_token_id] = pad_id
+            if _resp_video_token_id is not None:
+                _resp_slice[_resp_slice == _resp_video_token_id] = pad_id
+
+        # Build mm_token_type_ids from the PROMPT only. Response tokens are
+        # sampled text and must be type 0 — but a sampled token id may happen
+        # to equal image_token_id / video_token_id, which would create phantom
+        # vision groups inside get_rope_index and exhaust the grid_thw iterator
+        # (StopIteration). Mirrors ms-swift's collator, which builds
+        # mm_token_type_ids per-sample on the prompt before batching.
+        cfg = self.model.transformer.config
+        mm_token_type_ids = torch.zeros_like(full_ids)
+        image_token_id = getattr(cfg, "image_token_id", None)
+        video_token_id = getattr(cfg, "video_token_id", None)
+        if image_token_id is not None:
+            mm_token_type_ids[:, :max_real_len][prompt_ids == image_token_id] = 1
+        if video_token_id is not None:
+            mm_token_type_ids[:, :max_real_len][prompt_ids == video_token_id] = 2
+
         # 4-D M-RoPE position_ids: [text_arange; get_rope_index (t,h,w)].
         vision_pos = _vision_rope_positions(
             self.model.transformer,
@@ -459,6 +500,7 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
             image_grid_thw=igt,
             video_grid_thw=vgt,
             attention_mask=full_mask,
+            mm_token_type_ids=mm_token_type_ids,
         )  # [3, bs, seq]
         text_pos = full_mask.long().cumsum(-1) - 1
         text_pos.masked_fill_(full_mask == 0, 1)
