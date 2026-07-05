@@ -57,7 +57,6 @@ class ARTrainer(BaseTrainer):
         eval_num_prompts: int = 60,
         eval_samples_per_prompt: int = 16,
         eval_temperature: float = 1.0,
-        rollout_anchor_device: Optional[int] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -93,69 +92,18 @@ class ARTrainer(BaseTrainer):
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
             self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
 
+            rollout_parsed = parse_hydra_cfg(rollout_cfg)
+            if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
+                self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)  # for direct sampling
+            else:
+                self.rollout = remote(**rollout_parsed)  # for vllm / sglang
+
             self.reward = remote_hydra(reward_cfg)
             self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
-            if rollout_anchor_device is None:
-                # Default colocate-sibling layout: rollout is one per-device
-                # sibling in the placement scope (DP-sharded, TP=1).
-                rollout_parsed = parse_hydra_cfg(rollout_cfg)
-                if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
-                    self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)  # for direct sampling
-                else:
-                    self.rollout = remote(**rollout_parsed)  # for vllm / sglang
-
-                if sync_cfg is not None:
-                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
-            else:
-                # Anchor layout: weight_sync is a train-slab sibling (NCCL,
-                # cross-slab handshake below); create it inside the placement
-                # block like async_ar.py does — remote_hydra needs the scope.
-                if sync_cfg is not None:
-                    target = str(sync_cfg.get("_target_", ""))
-                    if not target.endswith("NCCLWeightSync"):
-                        raise ValueError(
-                            f"ARTrainer (rollout_anchor_device set) requires NCCLWeightSync "
-                            f"(rollout is cross-slab); got sync._target_={target!r}."
-                        )
-                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
-
-        if rollout_anchor_device is not None:
-            # Anchor layout (cf. unified_model.py:_wire_engine): pin the rollout
-            # engine to ONE worker process so SGLang's TP scheduler subprocesses
-            # can span all node-local GPUs via clear_cuda_visible. The engine is
-            # a single multi-GPU TP server, not a per-device DP replica.
-            rollout_parsed = parse_hydra_cfg(rollout_cfg)
-            role_cls = rollout_parsed.pop("role_cls")
-            # SGLang TP ranks start at base_gpu_id=rollout_anchor_device so they
-            # do NOT collide with FSDP rank 0 (GPU 0) in the weight-sync NCCL
-            # group — only FSDP rank 0 joins that group (RANK_ZERO), and it must
-            # be on a different GPU from every SGLang TP rank.
-            engine_kwargs = rollout_parsed.get("config", {}).get("engine_kwargs", {}) or {}
-            engine_kwargs.setdefault("base_gpu_id", int(rollout_anchor_device))
-            rollout_parsed.setdefault("config", {})["engine_kwargs"] = engine_kwargs
-            self.rollout = self.pool.create_remote(
-                role_cls,
-                device_ids=[int(rollout_anchor_device)],
-                init_kwargs=rollout_parsed,
-            )
-            self.rollout.sleep()  # keep the engine off until first wake_up
-
-            if self.weight_sync is not None:
-                # Cross-slab NCCL handshake (cf. async_ar.py:_connect_separate).
-                # SGLang TP>1: each anchor worker spawns tp_size TP ranks that
-                # ALL join the NCCL group (rank = rank_offset + tp_rank), so
-                # num_rollout_gpus must be tp_size, not len(workers)=1.
-                rollout_parsed_cfg = parse_hydra_cfg(rollout_cfg)
-                tp_size = int(rollout_parsed_cfg.get("config", {}).get("tp_size", 1) or 1)
-                addr, port = self.weight_sync.pick_master()[0]
-                self.weight_sync.set_rollout_targets(self.rollout.workers, self.rollout.role_name)
-                self.weight_sync.connect(
-                    master_addr=addr,
-                    master_port=port,
-                    num_rollout_gpus=max(len(self.rollout.workers), tp_size),
-                )
+            if sync_cfg is not None:
+                self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
 
     def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
         """Turn a data source batch into a typed :class:`RolloutReq`.

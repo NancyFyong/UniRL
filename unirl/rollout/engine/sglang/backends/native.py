@@ -187,18 +187,6 @@ class NativeBackend:
         # ``set_start_method`` is process-global; matches the HTTP impl so
         # torch CUDA init in the scheduler children happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
-
-        # Colocate anchor layout: the worker's CVD is pinned by Ray to a single
-        # ordinal; clear it so SGLang's TP scheduler subprocesses see all node
-        # GPUs. Mirrors vllm_omni's clear_cuda_visible. Must happen AFTER
-        # set_start_method (spawn children inherit the post-pop env).
-        if server_intent.get("clear_cuda_visible"):
-            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-            logger.info(
-                "NativeBackend: cleared CUDA_VISIBLE_DEVICES for SGLang TP (tp_size=%s)",
-                engine_kwargs.get("tp_size"),
-            )
-
         engine = rt["Engine"](**engine_kwargs)
 
         # Bind-mapping gate twin: the settled ServerArgs must echo the
