@@ -13,12 +13,12 @@
 # Smoke (1 GPU, 1 rollout, tiny model):
 #   python -m unirl.train_ar --config-name=ar/qwen3_5_grpo_text_sglang num_devices=1 num_rollouts=1
 #
-# Real run (32 GPU):
+# Real run (8 GPU):
 #   DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
 #   QWEN3_5_PATH=/path/to/Qwen3.5-9B \
-#   python -m unirl.train_ar --config-name=ar/qwen3_5_grpo_text_sglang num_devices=32
+#   python -m unirl.train_ar --config-name=ar/qwen3_5_grpo_text_sglang num_devices=8
 
-num_devices: 32
+num_devices: 8
 batch_size: 64  # prompts_per_rollout
 num_rollouts: 800
 weight_sync_interval: 1
@@ -91,16 +91,16 @@ rollout:
     max_new_tokens: 8192
     temperature: 1.0
     top_p: 1.0
-    concurrency: 16
+    concurrency: 128
     samples_pre_expanded: true
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
-      mem_fraction_static: 0.3
+      mem_fraction_static: 0.5
       skip_server_warmup: true
       attention_backend: triton
       disable_cuda_graph: false
-      cuda_graph_max_bs: 16
+      cuda_graph_max_bs: 128
       enable_lora: false
 
 reward:
