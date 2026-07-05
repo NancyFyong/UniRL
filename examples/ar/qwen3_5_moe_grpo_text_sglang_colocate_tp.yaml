@@ -1,0 +1,158 @@
+# @package _global_
+# AR GRPO Qwen3.5-MoE text-only on DAPO-Math — train_ar (ARTrainer),
+# SGLang rollout with tp_size=8 in the colocate anchor layout.
+#
+# Single-node 8-GPU: FSDP training spans 8 cards (DP=8); the rollout engine is
+# anchored on ONE worker and its SGLang TP=8 schedulers span all 8 cards via
+# clear_cuda_visible. Weight sync is cross-slab NCCL (TensorWeightSync is
+# sibling-only and does not apply). See `.codebuddy/plans/colocate_tp_plan.md`.
+#
+# Smoke (8 GPU, tiny model, 1 rollout):
+#   python -m unirl.train_ar --config-name=ar/qwen3_5_moe_grpo_text_sglang_colocate_tp num_devices=8 num_rollouts=1
+#
+# Real run (8 GPU):
+#   DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
+#   QWEN3_5_MOE_PATH=/path/to/Qwen3.5-35B-A3B \
+#   python -m unirl.train_ar --config-name=ar/qwen3_5_moe_grpo_text_sglang_colocate_tp num_devices=8
+
+num_devices: 8
+devices_per_node: 8
+rollout_anchor_device: 1   # anchor SGLang TP engine on worker 1 (keeps rank-0 worker off device 0)
+
+batch_size: 64  # prompts_per_rollout
+num_rollouts: 800
+weight_sync_interval: 1
+eval_interval: 10
+
+adv_normalization_scope: group
+normalize_adv_by_std: true
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-grpo
+  run_name: grpo_qwen3_5_moe_text_dapo_sglang_colocate_tp
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [grpo, qwen3_5, moe, text, dapo, sglang, colocate_tp]
+
+bundle:
+  _target_: unirl.models.qwen3_5.bundle.Qwen3_5Bundle.from_config
+  config:
+    _target_: unirl.models.qwen3_5.config.Qwen3_5PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_5_MOE_PATH,tiny-random/qwen3.5-moe}
+    model_precision: bf16
+    use_gradient_checkpointing: true
+    attn_implementation: null
+    trust_remote_code: false
+
+pipeline:
+  _target_: unirl.models.qwen3_5.pipeline.Qwen3_5Pipeline.from_bundle
+  enable_thinking: true
+  autocast_precision: bf16
+  logprob_precision: fp32
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3_5MoeDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    forward_prefetch: false
+    defer_grad_sync: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.01
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+
+rollout:
+  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    backend: native
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_5_MOE_PATH,tiny-random/qwen3.5-moe}
+    tp_size: 8
+    clear_cuda_visible: true   # pop Ray-pinned CVD so SGLang TP schedulers see all 8 GPUs
+    max_new_tokens: 8192
+    temperature: 1.0
+    top_p: 1.0
+    concurrency: 16
+    samples_pre_expanded: true
+    chat_template_kwargs:
+      enable_thinking: true
+    engine_kwargs:
+      mem_fraction_static: 0.3
+      skip_server_warmup: true
+      attention_backend: triton
+      disable_cuda_graph: false
+      cuda_graph_max_bs: 16
+      enable_lora: false
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  truncated_reward: keep
+  backend:
+    _target_: unirl.reward.local.mathverify.MathVerifyRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mathverify.MathVerifySpec
+
+algorithm:
+  _target_: unirl.algorithms.grpo.GRPO
+  stage_attr: ar
+  clip_range: 0.2
+  clip_range_high: null
+  clip_schedule: constant
+  loss_agg_mode: seq-mean-token-mean
+  horizon: 8192
+  sampling_temperature: 1.0
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3_5.conditions.Qwen3_5ARConditions
+
+sync:
+  _target_: unirl.distributed.weight_sync.full.nccl.NCCLWeightSync
+  lora_merged: false
+  bucket_size_mb: 64
+  flush_cache: true
+  name_remap: {"model.visual.*": null, "model.language_model.*": "model.*"}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 4
+  micro_planner:
+    _target_: unirl.train.stack.TokenBudgetPlanner
+    token_budget: 10240
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 64
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 8
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 8192

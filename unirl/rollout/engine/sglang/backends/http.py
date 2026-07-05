@@ -292,6 +292,17 @@ class HTTPBackend:
         # Forcing matches the predecessor so torch CUDA init in the child
         # happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
+
+        # Colocate anchor layout: clear the Ray-pinned CVD so the SRT subprocess
+        # sees all node GPUs for tp_size>1. Must happen BEFORE spawn so the
+        # child inherits the cleared env.
+        if server_intent.get("clear_cuda_visible"):
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            logger.info(
+                "HTTPBackend: cleared CUDA_VISIBLE_DEVICES for SGLang TP (tp_size=%s)",
+                server_kwargs.get("tp_size"),
+            )
+
         server_args = rt["ServerArgs"](**server_kwargs)
         process = multiprocessing.Process(target=rt["launch_server"], args=(server_args,))
         process.start()

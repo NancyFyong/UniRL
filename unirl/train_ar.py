@@ -45,6 +45,7 @@ def main(cfg: DictConfig) -> None:
         eval_num_prompts=cfg.get("eval_num_prompts", 60),
         eval_samples_per_prompt=cfg.get("eval_samples_per_prompt", 16),
         eval_temperature=cfg.get("eval_temperature", 1.0),
+        rollout_anchor_device=cfg.get("rollout_anchor_device"),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),

@@ -117,6 +117,13 @@ class SGLangEngineConfig(BaseEngineConfig):
     # --- Parallelism & GPU ---
     tp_size: Optional[int] = None
 
+    # Clear ``CUDA_VISIBLE_DEVICES`` before booting SGLang so its TP schedulers
+    # can see all node-local GPUs (mirrors vllm_omni's clear_cuda_visible).
+    # Required for ``tp_size>1`` in the colocate anchor layout — the anchor
+    # worker's CVD is pinned to a single ordinal by Ray, so SGLang's TP
+    # scheduler subprocesses would only see one card without this.
+    clear_cuda_visible: bool = False
+
     # --- SGLang network ---
     # ``host`` is the SRT bind address (default 0.0.0.0 so the server accepts
     # cross-node connections). ``port`` is kept for config-shape parity with
@@ -260,6 +267,10 @@ class SGLangEngineConfig(BaseEngineConfig):
         intent.setdefault("host", "0.0.0.0")
         intent.setdefault("tp_size", 1)
         intent.setdefault("mem_fraction_static", 0.88)
+
+        # Non-ServerArgs escape-hatch key consumed by NativeBackend/HTTPBackend
+        # before constructing the Engine / spawning the SRT subprocess.
+        intent["clear_cuda_visible"] = bool(self.clear_cuda_visible)
 
         return intent
 
