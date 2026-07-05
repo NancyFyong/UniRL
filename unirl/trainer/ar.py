@@ -57,6 +57,8 @@ class ARTrainer(BaseTrainer):
         eval_num_prompts: int = 60,
         eval_samples_per_prompt: int = 16,
         eval_temperature: float = 1.0,
+        rollout_tp_size: Optional[int] = None,
+        rollout_num_engines: Optional[int] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -86,24 +88,113 @@ class ARTrainer(BaseTrainer):
 
         # Set below from the `sync` block; None trainside (shares the module).
         self.weight_sync = None
+        # When True (anchor TP + LoRA), the SGLang engine stays resident and
+        # sleep/wake is skipped — SGLang TP>1's release/resume_memory_occupation
+        # blocks the actor event loop, deadlocking subsequent calls.
+        self._rollout_persistent = False
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
             self.bundle = remote_hydra(bundle_cfg)
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
             self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
 
-            rollout_parsed = parse_hydra_cfg(rollout_cfg)
-            if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
-                self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)  # for direct sampling
-            else:
-                self.rollout = remote(**rollout_parsed)  # for vllm / sglang
-
             self.reward = remote_hydra(reward_cfg)
             self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
-            if sync_cfg is not None:
-                self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
+            if rollout_tp_size is None:
+                # Default colocate-sibling layout: rollout is one per-device
+                # sibling in the placement scope (DP-sharded, TP=1).
+                rollout_parsed = parse_hydra_cfg(rollout_cfg)
+                if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
+                    self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)  # for direct sampling
+                else:
+                    self.rollout = remote(**rollout_parsed)  # for vllm / sglang
+
+                if sync_cfg is not None:
+                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
+            else:
+                # Anchor TP layout: weight_sync is a train-slab sibling; create
+                # it inside the placement block (remote_hydra needs the scope).
+                # Supports NCCLWeightSync (full-weight, cross-slab NCCL) and
+                # RemoteLoraWeightSync (LoRA, cross-slab Ray RPC push).
+                if sync_cfg is not None:
+                    target = str(sync_cfg.get("_target_", ""))
+                    if not target.endswith("NCCLWeightSync") and not target.endswith("RemoteLoraWeightSync"):
+                        raise ValueError(
+                            f"ARTrainer (rollout_tp_size set) requires NCCLWeightSync or "
+                            f"RemoteLoraWeightSync (rollout is cross-slab); got sync._target_={target!r}."
+                        )
+                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
+
+        if rollout_tp_size is not None:
+            # Anchor TP layout (cf. unified_model.py:_wire_engine + slime):
+            # pin N rollout engines to N workers, each engine spans tp_size GPUs
+            # via clear_cuda_visible + base_gpu_id=rank*tp_size. Handle.world_size
+            # = N; DP_SCATTER auto-dispatches the batch across engines.
+            tp = int(rollout_tp_size)
+
+            # Auto-compute num_engines if not specified: num_devices // tp_size.
+            # EP is a sub-division of TP (tp_size % ep_size == 0), does NOT
+            # increase GPU count; PP increases it (tp_size * pp_size per engine).
+            # For now only TP (and EP as TP sub-division) is supported; PP is
+            # a future extension (would multiply tp by pp_size in the formula).
+            if rollout_num_engines is None:
+                n_engines = self.num_devices // tp
+            else:
+                n_engines = int(rollout_num_engines)
+
+            # Boundary check: n_engines * tp_size must not exceed num_devices
+            # (rollout slab is a subset of or equal to the train slab).
+            total_rollout_gpus = n_engines * tp
+            if total_rollout_gpus > self.num_devices:
+                raise ValueError(
+                    f"ARTrainer (anchor TP): n_engines * tp_size = {n_engines} * {tp} "
+                    f"= {total_rollout_gpus} > num_devices={self.num_devices}. "
+                    f"Adjust rollout_tp_size / rollout_num_engines so they do not "
+                    f"exceed num_devices (EP is a TP sub-division, not a multiplier)."
+                )
+
+            # device_ids: which Worker process hosts each engine. Engine 0 is
+            # anchored on device 1 (NOT 0) to avoid sharing a Worker with
+            # trainer rank 0 (device 0) — RemoteLoraWeightSync.push calls the
+            # engine via Ray RPC from rank 0, which self-deadlocks if they
+            # share an actor (cf. unified_model.py:290 "base+1, NOT base").
+            # SGLang still uses GPUs 0..tp_size-1 via base_gpu_id=0 (engine.py
+            # forces base_gpu_id=0 when anchor+tp would exceed num_node_gpus).
+            device_ids = [max(1, i * tp) for i in range(n_engines)]
+
+            rollout_parsed = parse_hydra_cfg(rollout_cfg)
+            role_cls = rollout_parsed.pop("role_cls")
+            self.rollout = self.pool.create_remote(
+                role_cls,
+                device_ids=device_ids,
+                init_kwargs=rollout_parsed,
+            )
+            # When using RemoteLoraWeightSync, keep the engine resident (no
+            # sleep/wake) — SGLang TP>1's release/resume_memory_occupation
+            # blocks the actor event loop. FSDP cpu_offload compensates for
+            # the GPU memory the engine holds during training.
+            sync_target = str(sync_cfg.get("_target_", "")) if sync_cfg else ""
+            if sync_target.endswith("RemoteLoraWeightSync"):
+                self._rollout_persistent = True
+
+            if self.weight_sync is not None:
+                sync_target = str(sync_cfg.get("_target_", ""))
+                if sync_target.endswith("RemoteLoraWeightSync"):
+                    # RemoteLoraWeightSync.set_rollout_targets takes List[(role, [workers])]
+                    self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
+                else:
+                    # NCCLWeightSync.set_rollout_targets takes (actor_handles, role_name)
+                    self.weight_sync.set_rollout_targets(self.rollout.workers, self.rollout.role_name)
+                    if sync_target.endswith("NCCLWeightSync"):
+                        addr, port = self.weight_sync.pick_master()[0]
+                        self.weight_sync.connect(
+                            master_addr=addr,
+                            master_port=port,
+                            num_rollout_gpus=len(self.rollout.workers),
+                            tp_size=tp,
+                        )
 
     def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
         """Turn a data source batch into a typed :class:`RolloutReq`.
@@ -139,11 +230,13 @@ class ARTrainer(BaseTrainer):
         ``rollout_id`` only keys the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
-        self.rollout.wake_up()
+        if not self._rollout_persistent:
+            self.rollout.wake_up()
         if sync_weights and self.weight_sync is not None:
             self.weight_sync.sync()
         resp = self.rollout.generate(req)
-        self.rollout.sleep()
+        if not self._rollout_persistent:
+            self.rollout.sleep()
 
         for name, track in list(resp.tracks.items()):
             if track.segment is not None:
@@ -209,11 +302,13 @@ class ARTrainer(BaseTrainer):
             sampling_params=eval_sp,
             metadata=list(inputs.metadata) if inputs.metadata else [],
         )
-        self.rollout.wake_up()
+        if not self._rollout_persistent:
+            self.rollout.wake_up()
         if self.weight_sync is not None:
             self.weight_sync.sync()
         resp = self.rollout.generate(req)
-        self.rollout.sleep()
+        if not self._rollout_persistent:
+            self.rollout.sleep()
 
         acc = 0.0
         for track in resp.tracks.values():

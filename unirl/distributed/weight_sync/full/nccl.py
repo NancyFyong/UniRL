@@ -95,13 +95,25 @@ class NCCLWeightSync(FullWeightSync):
         self._rollout_role = str(role_name)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
-    def connect(self, *, master_addr: str, master_port: int, num_rollout_gpus: int) -> None:
+    def connect(
+        self,
+        *,
+        master_addr: str,
+        master_port: int,
+        num_rollout_gpus: int,
+        tp_size: int = 1,
+    ) -> None:
         """Bring up the broadcast group (rank 0 + all rollout workers).
 
         Fires each rollout worker's ``init_weights_update_group`` NON-BLOCKING
         first, then joins as group rank 0 (which blocks on the barrier), then
         awaits the rollout joins. The non-blocking fire is what lets the
         rendezvous complete — no thread needed (distinct processes).
+
+        ``tp_size>1``: each rollout worker (engine) contributes ``tp_size`` TP
+        ranks to the NCCL group (SGLang computes ``rank = rank_offset + tp_rank``
+        internally). So ``world_size = num_rollout_gpus * tp_size + 1`` and
+        ``rank_offset = i * tp_size + 1`` (mirrors slime's engine_gpu_counts).
         """
         import ray
 
@@ -110,7 +122,8 @@ class NCCLWeightSync(FullWeightSync):
         if self._rollout_role is None:
             raise RuntimeError("NCCLWeightSync.connect: call set_rollout_targets() first")
 
-        world = int(num_rollout_gpus) + 1
+        tp = int(tp_size)
+        world = int(num_rollout_gpus) * tp + 1
         refs = [
             handle.call.remote(
                 self._rollout_role,
@@ -119,7 +132,7 @@ class NCCLWeightSync(FullWeightSync):
                 {
                     "master_address": master_addr,
                     "master_port": int(master_port),
-                    "rank_offset": i + 1,
+                    "rank_offset": i * tp + 1,
                     "world_size": world,
                     "group_name": self._group_name,
                     "backend": "nccl",

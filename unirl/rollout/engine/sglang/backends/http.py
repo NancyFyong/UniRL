@@ -292,9 +292,30 @@ class HTTPBackend:
         # Forcing matches the predecessor so torch CUDA init in the child
         # happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
-        server_args = rt["ServerArgs"](**server_kwargs)
-        process = multiprocessing.Process(target=rt["launch_server"], args=(server_args,))
-        process.start()
+
+        # Colocate anchor TP: set CVD to all node-local GPUs before spawning
+        # the SRT subprocess so it sees all cards for tp_size>1. Restore after
+        # spawn so the host Worker keeps its Ray-set CVD.
+        original_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if server_intent.get("clear_cuda_visible"):
+            num_node_gpus = int(server_intent.get("num_node_gpus", 8))
+            all_gpus = ",".join(str(i) for i in range(num_node_gpus))
+            os.environ["CUDA_VISIBLE_DEVICES"] = all_gpus
+            logger.info(
+                "HTTPBackend: set CUDA_VISIBLE_DEVICES=%s for SGLang TP (tp_size=%s, base_gpu_id=%s)",
+                all_gpus,
+                server_kwargs.get("tp_size"),
+                server_kwargs.get("base_gpu_id"),
+            )
+        try:
+            server_args = rt["ServerArgs"](**server_kwargs)
+            process = multiprocessing.Process(target=rt["launch_server"], args=(server_args,))
+            process.start()
+        finally:
+            if original_cvd is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = original_cvd
+            else:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
         base_url = f"http://{advertise_host}:{server_kwargs['port']}"
         wait_server_healthy(

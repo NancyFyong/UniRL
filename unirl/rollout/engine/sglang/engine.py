@@ -22,6 +22,7 @@ subprocesses need is quarantined in the backends' ``boot``.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -111,6 +112,52 @@ class SGLangRolloutEngine(BaseRolloutEngine):
 
         # Backend (the seam) — booted from the config-spelled intent.
         intent = config.server_intent(ports=ports, extra=self.adapter.boot_kwargs())
+
+        # Colocate anchor TP: derive base_gpu_id from the worker's physical
+        # GPU (Ray-pinned CVD) so each DP engine uses a disjoint TP slice.
+        # rank may be None and os.environ["RANK"] is the FSDP global rank
+        # (not the engine index), so neither is reliable here. The worker's
+        # CVD — still Ray-pinned to a single ordinal at this point — gives
+        # the correct physical GPU id (= i * tp_size for engine i).
+        # Mirrors slime's `gpu_offset + i * num_gpu_per_engine` (rollout.py:180).
+        if config.clear_cuda_visible:
+            tp = int(config.tp_size or 1)
+            # base_gpu_id: always 0 for single-engine (spans all node GPUs
+            # via clear_cuda_visible). For multi-engine, derive from the
+            # worker's CVD (anchor_gpu = i*tp_size for engine i).
+            # The CVD is Ray-pinned to the anchor device; for single-engine
+            # the anchor is device 1 (to avoid trainer rank 0 self-deadlock
+            # in RemoteLoraWeightSync), but base_gpu_id must still be 0 so
+            # SGLang uses GPUs 0..tp_size-1.
+            cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            try:
+                anchor_gpu = int(cvd.split(",")[0]) if cvd else 0
+            except ValueError:
+                anchor_gpu = 0
+            # Multi-engine: each engine uses [anchor, anchor+tp). Single-engine
+            # (n_engines=1): use [0, tp) regardless of anchor (the anchor just
+            # determines which Worker PROCESS hosts the engine, not which GPUs).
+            base = anchor_gpu if anchor_gpu + tp <= config.num_node_gpus else 0
+            if base + tp > config.num_node_gpus:
+                base = 0
+            intent["base_gpu_id"] = base
+            logger.info(
+                "SGLang anchor TP: anchor_gpu=%s tp_size=%s base_gpu_id=%s (GPUs %s..%s)",
+                anchor_gpu,
+                tp,
+                base,
+                base,
+                base + tp - 1,
+            )
+            logger.info(
+                "SGLang anchor TP: anchor_gpu=%s tp_size=%s base_gpu_id=%s (GPUs %s..%s)",
+                anchor_gpu,
+                tp,
+                base,
+                base,
+                base + tp - 1,
+            )
+
         concurrency = int(engine_kwargs.get("concurrency", config.concurrency))
         if config.backend == "native":
             self._backend = NativeBackend.boot(intent, concurrency=concurrency)

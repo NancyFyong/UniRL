@@ -98,3 +98,4 @@ settings.json
 !.cursor/rules/
 REFACTOR_LOG.md
 uv.lock
+data/

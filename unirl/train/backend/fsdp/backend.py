@@ -81,6 +81,10 @@ class FSDPBackend(BaseFSDP2Backend):
         )
 
         model = resolve_trainable_module(bundle, trainable_attr)
+        # Cast FP8 quantized weights to bf16 so peft LoRA injection
+        # (check_uniform_bounds) and FSDP param init don't hit Float8_e4m3fn.
+        if hasattr(model, "to"):
+            model = model.to(torch.bfloat16)
         shadow = self._inject_structural(model, lora_cfg, ema_lora_cfg, ema_cfg)
 
         fsdp_wrap(
