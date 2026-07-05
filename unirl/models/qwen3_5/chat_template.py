@@ -91,12 +91,8 @@ class Qwen3_5ChatTemplateStage:
                 "Qwen3_5Bundle.from_config sets pad_token=eos_token when absent."
             )
 
-        input_ids = torch.full(
-            (batch_size, max_len), pad_id, dtype=torch.long, device=device
-        )
-        attention_mask = torch.zeros(
-            (batch_size, max_len), dtype=torch.long, device=device
-        )
+        input_ids = torch.full((batch_size, max_len), pad_id, dtype=torch.long, device=device)
+        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
 
         for i, inp in enumerate(per_sample_inputs):
             ids = inp["input_ids"].squeeze(0)
@@ -113,9 +109,7 @@ class Qwen3_5ChatTemplateStage:
             pv = inp.get("pixel_values")
             igt = inp.get("image_grid_thw")
             vgt = inp.get("video_grid_thw")
-            pixel_values.append(
-                pv.to(device=device, dtype=dtype) if pv is not None else None
-            )
+            pixel_values.append(pv.to(device=device, dtype=dtype) if pv is not None else None)
             image_grid_thw.append(igt.to(device=device) if igt is not None else None)
             video_grid_thw.append(vgt.to(device=device) if vgt is not None else None)
 
@@ -123,9 +117,7 @@ class Qwen3_5ChatTemplateStage:
         has_vid = any(v is not None for v in video_grid_thw)
 
         return Qwen3_5ARConditions(
-            prompt=TextTokenCondition(
-                input_ids=input_ids, attention_mask=attention_mask
-            ),
+            prompt=TextTokenCondition(input_ids=input_ids, attention_mask=attention_mask),
             pixel_values=pixel_values if has_img else None,
             image_grid_thw=image_grid_thw if has_img else None,
             video_grid_thw=video_grid_thw if has_vid else None,

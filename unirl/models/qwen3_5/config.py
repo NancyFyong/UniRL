@@ -59,9 +59,7 @@ class Qwen3_5PipelineConfig:
     enable_thinking: bool = False
 
     def __post_init__(self) -> None:
-        validate_precision_type(
-            self.model_precision, field="Qwen3_5PipelineConfig.model_precision"
-        )
+        validate_precision_type(self.model_precision, field="Qwen3_5PipelineConfig.model_precision")
 
 
 __all__ = ["Qwen3_5PipelineConfig"]

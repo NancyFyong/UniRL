@@ -89,35 +89,25 @@ def _patch_fast_pos_embed_interpolate(visual_module: nn.Module) -> None:
                 weight_list[i].extend(weights[i].tolist())
 
         idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
-        weight_tensor = torch.tensor(
-            weight_list, dtype=self.pos_embed.weight.dtype, device=device
-        )
+        weight_tensor = torch.tensor(weight_list, dtype=self.pos_embed.weight.dtype, device=device)
         pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
-        patch_pos_embeds = patch_pos_embeds.split(
-            [h * w for h, w in zip(grid_hs, grid_ws, strict=False)]
-        )
+        patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws, strict=False)])
 
         patch_pos_embeds_permute = []
         merge_size = self.config.spatial_merge_size
-        for pos_embed, t, h, w in zip(
-            patch_pos_embeds, grid_ts, grid_hs, grid_ws, strict=False
-        ):
+        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws, strict=False):
             pos_embed = pos_embed.repeat(t, 1)
             pos_embed = (
-                pos_embed.view(
-                    t, h // merge_size, merge_size, w // merge_size, merge_size, -1
-                )
+                pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
                 .permute(0, 1, 3, 2, 4, 5)
                 .flatten(0, 4)
             )
             patch_pos_embeds_permute.append(pos_embed)
         return torch.cat(patch_pos_embeds_permute)
 
-    visual_module.fast_pos_embed_interpolate = types.MethodType(
-        fast_pos_embed_interpolate, visual_module
-    )
+    visual_module.fast_pos_embed_interpolate = types.MethodType(fast_pos_embed_interpolate, visual_module)
 
 
 def _model_class_for(model_type: str):
@@ -129,10 +119,7 @@ def _model_class_for(model_type: str):
     elif model_type == "qwen3_5_moe":
         from transformers import Qwen3_5MoeForConditionalGeneration as Cls
     else:
-        raise ValueError(
-            f"Qwen3_5Bundle: unexpected model_type {model_type!r}; expected "
-            f"'qwen3_5' or 'qwen3_5_moe'."
-        )
+        raise ValueError(f"Qwen3_5Bundle: unexpected model_type {model_type!r}; expected 'qwen3_5' or 'qwen3_5_moe'.")
     major = int(transformers.__version__.split(".")[0])
     if major < 5:
         raise RuntimeError(
@@ -170,19 +157,13 @@ class Qwen3_5Bundle(Bundle):
 
         path = config.pretrained_model_ckpt_path
 
-        device = config.device or torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):
             device = torch.device(device)
 
-        dtype = parse_torch_dtype(
-            config.model_precision, field_name="model_precision"
-        )
+        dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
 
-        hf_config = AutoConfig.from_pretrained(
-            path, trust_remote_code=bool(config.trust_remote_code)
-        )
+        hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
         model_type = hf_config.model_type
         ModelCls = _model_class_for(model_type)
 
@@ -227,9 +208,7 @@ class Qwen3_5Bundle(Bundle):
 
         if config.use_gradient_checkpointing:
             if hasattr(transformer, "gradient_checkpointing_enable"):
-                transformer.gradient_checkpointing_enable(
-                    gradient_checkpointing_kwargs={"use_reentrant": False}
-                )
+                transformer.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
             else:
                 logger.warning(
                     "Qwen3_5 transformer %s does not expose gradient_checkpointing_enable; "

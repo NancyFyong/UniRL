@@ -38,9 +38,7 @@ class Qwen3_5Pipeline(Pipeline):
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        self.chat_template = (
-            chat_template if chat_template is not None else Qwen3_5ChatTemplateStage(bundle)
-        )
+        self.chat_template = chat_template if chat_template is not None else Qwen3_5ChatTemplateStage(bundle)
         self.ar = (
             ar
             if ar is not None
@@ -94,9 +92,7 @@ class Qwen3_5Pipeline(Pipeline):
     def from_config(cls, config: Qwen3_5PipelineConfig) -> "Qwen3_5Pipeline":
         """Build the full pipeline from a config."""
         if isinstance(config, dict):
-            config = Qwen3_5PipelineConfig(
-                **{k: v for k, v in config.items() if k != "_target_"}
-            )
+            config = Qwen3_5PipelineConfig(**{k: v for k, v in config.items() if k != "_target_"})
         bundle = Qwen3_5Bundle.from_config(config)
         chat_template = Qwen3_5ChatTemplateStage(
             bundle,
@@ -163,9 +159,7 @@ class Qwen3_5Pipeline(Pipeline):
             stop_token_id=None,
         )
 
-        segment = self.ar.autoregress(
-            conds, sampling_params=sampling_params, params=params
-        )
+        segment = self.ar.autoregress(conds, sampling_params=sampling_params, params=params)
         decoded = self._detokenize(segment)
 
         return RolloutResp(

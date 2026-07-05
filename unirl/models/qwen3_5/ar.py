@@ -72,9 +72,7 @@ def _replay_aware_forward(
         torch.backends.cuda.enable_cudnn_sdp(False)
 
     autocast_ctx = (
-        torch.autocast("cuda", autocast_dtype)
-        if autocast_dtype in (torch.float16, torch.bfloat16)
-        else nullcontext()
+        torch.autocast("cuda", autocast_dtype) if autocast_dtype in (torch.float16, torch.bfloat16) else nullcontext()
     )
     with autocast_ctx:
         hidden = self.model(**kw, use_cache=False, return_dict=True).last_hidden_state  # [B, L, H]
@@ -155,9 +153,7 @@ class Qwen3_5ARStep(ARStep):
 
     def step(self, logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if logits.dim() != 2:
-            raise ValueError(
-                f"Qwen3_5ARStep.step: expected logits shape [B, vocab], got {tuple(logits.shape)}"
-            )
+            raise ValueError(f"Qwen3_5ARStep.step: expected logits shape [B, vocab], got {tuple(logits.shape)}")
 
         if self.temperature <= 0.0:
             log_probs_full = F.log_softmax(logits.float(), dim=-1)
@@ -262,12 +258,8 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
         logprob_precision: str = "fp32",
     ) -> None:
         self.model = model
-        self.autocast_dtype = parse_torch_dtype(
-            autocast_precision, field_name="Qwen3_5ARStage.autocast_precision"
-        )
-        self.logprob_dtype = parse_torch_dtype(
-            logprob_precision, field_name="Qwen3_5ARStage.logprob_precision"
-        )
+        self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="Qwen3_5ARStage.autocast_precision")
+        self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="Qwen3_5ARStage.logprob_precision")
         transformer = model.transformer
         if getattr(transformer.forward, "__func__", None) is not _replay_aware_forward:
             transformer.forward = MethodType(_replay_aware_forward, transformer)
@@ -284,13 +276,9 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
         **_kwargs: Any,
     ) -> TextSegment:
         if conditions.prompt is None or conditions.prompt.input_ids is None:
-            raise ValueError(
-                "Qwen3_5ARStage.autoregress: requires conditions.prompt.input_ids"
-            )
+            raise ValueError("Qwen3_5ARStage.autoregress: requires conditions.prompt.input_ids")
         if conditions.prompt.attention_mask is None:
-            raise ValueError(
-                "Qwen3_5ARStage.autoregress: requires conditions.prompt.attention_mask"
-            )
+            raise ValueError("Qwen3_5ARStage.autoregress: requires conditions.prompt.attention_mask")
 
         transformer = self.model.transformer
         input_ids: torch.Tensor = conditions.prompt.input_ids
@@ -325,9 +313,7 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
             "attention_mask": attention_mask,
             "use_cache": True,
             "past_key_values": None,
-            "cache_position": torch.arange(
-                int(input_ids.shape[1]), device=device, dtype=torch.long
-            ),
+            "cache_position": torch.arange(int(input_ids.shape[1]), device=device, dtype=torch.long),
         }
 
         cur_input_ids = input_ids
@@ -354,17 +340,13 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
             else:
                 prep_kwargs["is_first_iteration"] = False
 
-            model_inputs = transformer.prepare_inputs_for_generation(
-                cur_input_ids, **prep_kwargs
-            )
+            model_inputs = transformer.prepare_inputs_for_generation(cur_input_ids, **prep_kwargs)
             # Qwen3.5 requires mm_token_type_ids on multimodal forwards where
             # position_ids is None (compute_3d_position_ids reads it). Build it
             # from the token ids and inject into model_inputs for the first step
             # (decode steps carry no image tokens, so 0 is correct).
             if is_first_step and (pv is not None or vgt is not None):
-                model_inputs["mm_token_type_ids"] = _build_mm_token_type_ids(
-                    transformer, cur_input_ids
-                )
+                model_inputs["mm_token_type_ids"] = _build_mm_token_type_ids(transformer, cur_input_ids)
             with torch.no_grad():
                 out = transformer(**model_inputs, return_dict=True)
             logits = out.logits
@@ -423,13 +405,9 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
         if conditions.prompt is None or conditions.prompt.input_ids is None:
             raise ValueError("Qwen3_5ARStage.padding_replay: conditions.prompt.input_ids is None")
         if conditions.prompt.attention_mask is None:
-            raise ValueError(
-                "Qwen3_5ARStage.padding_replay: conditions.prompt.attention_mask is None"
-            )
+            raise ValueError("Qwen3_5ARStage.padding_replay: conditions.prompt.attention_mask is None")
         if segment.tokens is None or segment.cu_seqlens is None or segment.lengths is None:
-            raise ValueError(
-                "Qwen3_5ARStage.padding_replay: segment requires tokens with cu_seqlens"
-            )
+            raise ValueError("Qwen3_5ARStage.padding_replay: segment requires tokens with cu_seqlens")
 
         device = next(self.model.transformer.parameters()).device
         prompt_ids = conditions.prompt.input_ids.to(device)
@@ -457,20 +435,14 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
         lengths = [int(n) for n in segment.lengths.tolist()]
         T_max = max(lengths) if lengths else 0
         pad_id = self.model.tokenizer.pad_token_id or 0
-        response_tokens = torch.full(
-            (batch_size, T_max), pad_id, dtype=torch.long, device=device
-        )
-        response_mask = torch.zeros(
-            (batch_size, T_max), dtype=torch.long, device=device
-        )
+        response_tokens = torch.full((batch_size, T_max), pad_id, dtype=torch.long, device=device)
+        response_mask = torch.zeros((batch_size, T_max), dtype=torch.long, device=device)
         cu = [int(c) for c in segment.cu_seqlens.tolist()]
         for b in range(batch_size):
             n = lengths[b]
             if n == 0:
                 continue
-            response_tokens[b, :n] = segment.tokens[cu[b] : cu[b] + n].to(
-                device=device, dtype=torch.long
-            )
+            response_tokens[b, :n] = segment.tokens[cu[b] : cu[b] + n].to(device=device, dtype=torch.long)
             response_mask[b, :n] = 1
 
         if T_max > 0:
@@ -555,14 +527,8 @@ def _pack_text_segment(
     device: torch.device,
 ) -> TextSegment:
     return TextSegment.pack(
-        tokens=[
-            torch.tensor(toks, dtype=torch.long, device=device)
-            for toks in generated_tokens
-        ],
-        log_probs=[
-            torch.tensor(lps, dtype=torch.float32, device=device)
-            for lps in per_token_logps
-        ],
+        tokens=[torch.tensor(toks, dtype=torch.long, device=device) for toks in generated_tokens],
+        log_probs=[torch.tensor(lps, dtype=torch.float32, device=device) for lps in per_token_logps],
     )
 
 
