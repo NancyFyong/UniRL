@@ -11,12 +11,14 @@
 
 num_devices: 8
 batch_size: 32
-num_rollouts: 800
+num_rollouts: 1000
 train_fraction: 0.5
 max_inflight: 1
 buffer_max_staleness: 0
 weight_sync_interval: 1
 eval_interval: 10
+save_interval: 10
+eval_samples_per_prompt: 4
 
 adv_normalization_scope: group
 normalize_adv_by_std: false
@@ -79,22 +81,22 @@ rollout:
     _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
     backend: native
     pretrained_model_ckpt_path: ${oc.env:QWEN3_5_MOE_PATH,tiny-random/qwen3.5-moe}
-    tp_size: 4
+    tp_size: 1
     max_new_tokens: 8192
     temperature: 1.0
     top_p: 1.0
-    concurrency: 64
+    concurrency: 256
     samples_pre_expanded: true
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
-      mem_fraction_static: 0.6
+      mem_fraction_static: 0.85
       skip_server_warmup: true
       attention_backend: triton
-      disable_cuda_graph: true
-      cuda_graph_max_bs: 1
+      disable_cuda_graph: false
+      cuda_graph_max_bs: 32
       enable_lora: false
-      ep_size: 4
+      ep_size: 1
       moe_dp_size: 1
 
 reward:
