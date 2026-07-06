@@ -2,9 +2,8 @@
 # AR GRPO Qwen3.5-MoE text-only on DAPO-Math — train_ar (ARTrainer),
 # SGLang rollout, full-weight TensorWeightSync, colocate.
 #
-# MoE variant: block_class_names uses Qwen3_5MoeDecoderLayer; tp_size=8 to
-# fit the 35B-A3B (256 experts, EP=1 full backbone replicated, same as the
-# existing Qwen3-30B-A3B recipe).
+# MoE variant: block_class_names uses Qwen3_5MoeDecoderLayer; tp_size=8 EP=8.
+# VeOmni backend for training (FSDP2 + SP). Rollout engine mem_fraction=0.6.
 #
 # Smoke default uses tiny-random/qwen3.5-moe (<10MB) for 1-GPU e2e. Override
 # QWEN3_5_MOE_PATH for real training.
@@ -12,7 +11,7 @@
 # Smoke (1 GPU, 1 rollout, tiny model):
 #   python -m unirl.train_ar --config-name=ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang num_devices=1 num_rollouts=1
 #
-# Real run (32 GPU):
+# Real run (8 GPU):
 #   DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
 #   QWEN3_5_MOE_PATH=/path/to/Qwen3.5-35B-A3B \
 #   python -m unirl.train_ar --config-name=ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang num_devices=8
@@ -31,7 +30,7 @@ logging:
   project_name: unirl-grpo
   run_name: grpo_qwen3_5_moe_text_dapo_sglang
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [grpo, qwen3_5, moe, text, dapo, sglang]
+  tags: [grpo, qwen3_5, moe, text, dapo, sglang, ep8, veomni]
 
 bundle:
   _target_: unirl.models.qwen3_5.bundle.Qwen3_5Bundle.from_config
@@ -42,6 +41,7 @@ bundle:
     use_gradient_checkpointing: true
     attn_implementation: null
     trust_remote_code: false
+    meta_init_transformer: true
 
 pipeline:
   _target_: unirl.models.qwen3_5.pipeline.Qwen3_5Pipeline.from_bundle
@@ -50,7 +50,7 @@ pipeline:
   logprob_precision: fp32
 
 backend:
-  _target_: unirl.train.backend.fsdp.FSDPBackend
+  _target_: unirl.train.backend.veomni.VeOmniBackend
   block_class_names: ["Qwen3_5MoeDecoderLayer"]
   trainable_attr: transformer
   fsdp_cfg:
@@ -87,17 +87,19 @@ rollout:
     max_new_tokens: 8192
     temperature: 1.0
     top_p: 1.0
-    concurrency: 16
+    concurrency: 128
     samples_pre_expanded: true
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
-      mem_fraction_static: 0.3
+      mem_fraction_static: 0.6
       skip_server_warmup: true
       attention_backend: triton
-      disable_cuda_graph: false
-      cuda_graph_max_bs: 16
+      disable_cuda_graph: true
+      cuda_graph_max_bs: 1
       enable_lora: false
+      ep_size: 8
+      moe_dp_size: 1
 
 reward:
   _target_: unirl.reward.service.RewardService
