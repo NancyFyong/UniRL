@@ -1,36 +1,32 @@
 # @package _global_
-# AR GRPO Qwen3.5-MoE text-only on DAPO-Math — train_ar (ARTrainer),
-# SGLang rollout, full-weight TensorWeightSync, colocate.
+# ASYNC AR GRPO Qwen3.5-MoE-35B-A3B on DAPO-Math — AsyncARTrainer, SGLang rollout.
 #
-# MoE variant: block_class_names uses Qwen3_5MoeDecoderLayer; tp_size=8 EP=8.
-# VeOmni backend for training (FSDP2 + SP). Rollout engine mem_fraction=0.6.
+# Disaggregated: 4 GPU train (VeOmni FSDP2) + 4 GPU rollout (SGLang TP=4 EP=4).
+# Full-weight NCCLWeightSync crosses the slab boundary. Engine stays resident.
 #
-# Smoke default uses tiny-random/qwen3.5-moe (<10MB) for 1-GPU e2e. Override
-# QWEN3_5_MOE_PATH for real training.
-#
-# Smoke (1 GPU, 1 rollout, tiny model):
-#   python -m unirl.train_ar --config-name=ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang num_devices=1 num_rollouts=1
-#
-# Real run (8 GPU):
+# Run (8 GPU, 4 train / 4 rollout):
 #   DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
 #   QWEN3_5_MOE_PATH=/path/to/Qwen3.5-35B-A3B \
-#   python -m unirl.train_ar --config-name=ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang num_devices=8
+#   python -m unirl.train_async_ar --config-name=ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang_async num_devices=8
 
 num_devices: 8
-batch_size: 64
+batch_size: 32
 num_rollouts: 800
+train_fraction: 0.5
+max_inflight: 1
+buffer_max_staleness: 0
 weight_sync_interval: 1
 eval_interval: 10
 
 adv_normalization_scope: group
-normalize_adv_by_std: true
+normalize_adv_by_std: false
 
 logging:
   report_to_wandb: true
   project_name: unirl-grpo
-  run_name: grpo_qwen3_5_moe_text_dapo_sglang
+  run_name: grpo_qwen3_5_moe_35b_a3b_dapo_sglang_async
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [grpo, qwen3_5, moe, text, dapo, sglang, ep8, veomni]
+  tags: [grpo, qwen3_5, moe, 35b, a3b, dapo, sglang, async, ep4, veomni]
 
 bundle:
   _target_: unirl.models.qwen3_5.bundle.Qwen3_5Bundle.from_config
@@ -83,11 +79,11 @@ rollout:
     _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
     backend: native
     pretrained_model_ckpt_path: ${oc.env:QWEN3_5_MOE_PATH,tiny-random/qwen3.5-moe}
-    tp_size: 8
+    tp_size: 4
     max_new_tokens: 8192
     temperature: 1.0
     top_p: 1.0
-    concurrency: 128
+    concurrency: 64
     samples_pre_expanded: true
     chat_template_kwargs:
       enable_thinking: true
@@ -96,9 +92,9 @@ rollout:
       skip_server_warmup: true
       attention_backend: triton
       disable_cuda_graph: true
-      cuda_graph_max_bs: 16
+      cuda_graph_max_bs: 1
       enable_lora: false
-      ep_size: 8
+      ep_size: 4
       moe_dp_size: 1
 
 reward:
@@ -114,9 +110,9 @@ algorithm:
   _target_: unirl.algorithms.grpo.GRPO
   stage_attr: ar
   clip_range: 0.2
-  clip_range_high: null
+  clip_range_high: 0.28
   clip_schedule: constant
-  loss_agg_mode: seq-mean-token-mean
+  loss_agg_mode: seq-mean-token-sum-norm
   horizon: 8192
   sampling_temperature: 1.0
   conditions_cls:
@@ -124,9 +120,10 @@ algorithm:
     path: unirl.models.qwen3_5.conditions.Qwen3_5ARConditions
 
 sync:
-  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  _target_: unirl.distributed.weight_sync.full.nccl.NCCLWeightSync
+  group_name: weight_sync
   lora_merged: false
-  bucket_size_mb: 64
+  bucket_size_mb: 512
   flush_cache: true
   name_remap: {"model.visual.*": null, "model.language_model.*": "model.*"}
 
@@ -147,7 +144,7 @@ data_source:
       eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
       seed: 42
     algorithm:
-      prompts_per_rollout: 64
+      prompts_per_rollout: 32
 
 sampling:
   _target_: unirl.types.sampling.ARSamplingParams
