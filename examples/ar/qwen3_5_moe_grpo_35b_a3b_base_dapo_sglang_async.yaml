@@ -18,7 +18,7 @@ buffer_max_staleness: 0
 weight_sync_interval: 1
 eval_interval: 10
 save_interval: 10
-eval_samples_per_prompt: 4
+eval_samples_per_prompt: 16
 
 adv_normalization_scope: group
 normalize_adv_by_std: false
