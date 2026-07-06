@@ -13,9 +13,9 @@
 # Real run (32 GPU):
 #   DATA_PATH=data/geo3k_mc/train.jsonl EVAL_DATA_PATH=data/geo3k_mc/val.jsonl \
 #   QWEN3_5_MOE_PATH=/path/to/Qwen3.5-35B-A3B \
-#   python -m unirl.train_ar --config-name=ar/qwen3_5_moe_grpo_35b_a3b_geo3k_mc_sglang num_devices=32
+#   python -m unirl.train_ar --config-name=ar/qwen3_5_moe_grpo_35b_a3b_geo3k_mc_sglang num_devices=8
 
-num_devices: 32
+num_devices: 8
 batch_size: 32
 num_rollouts: 2000
 weight_sync_interval: 1
