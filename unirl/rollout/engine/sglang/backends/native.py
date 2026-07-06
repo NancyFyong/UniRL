@@ -187,30 +187,7 @@ class NativeBackend:
         # ``set_start_method`` is process-global; matches the HTTP impl so
         # torch CUDA init in the scheduler children happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
-
-        # Colocate anchor TP: set CVD to all node-local GPUs so SGLang's TP
-        # schedulers see them. base_gpu_id (injected by the engine) + gpu_id_step=1
-        # then selects [base, base+1, ..., base+tp_size-1]. Restore CVD after
-        # boot so the host Worker's other roles (FSDP) keep their Ray-set CVD.
-        # Mirrors slime's NOSET_CVD pattern (rollout.py:189).
-        original_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if server_intent.get("clear_cuda_visible"):
-            num_node_gpus = int(server_intent.get("num_node_gpus", 8))
-            all_gpus = ",".join(str(i) for i in range(num_node_gpus))
-            os.environ["CUDA_VISIBLE_DEVICES"] = all_gpus
-            logger.info(
-                "NativeBackend: set CUDA_VISIBLE_DEVICES=%s for SGLang TP (tp_size=%s, base_gpu_id=%s)",
-                all_gpus,
-                engine_kwargs.get("tp_size"),
-                engine_kwargs.get("base_gpu_id"),
-            )
-        try:
-            engine = rt["Engine"](**engine_kwargs)
-        finally:
-            if original_cvd is not None:
-                os.environ["CUDA_VISIBLE_DEVICES"] = original_cvd
-            else:
-                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        engine = rt["Engine"](**engine_kwargs)
 
         # Bind-mapping gate twin: the settled ServerArgs must echo the
         # reserved ports verbatim — a runtime upgrade that silently re-settles

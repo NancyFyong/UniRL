@@ -29,23 +29,6 @@ from unirl.train.backend.sharded_state import _build_state_dict_options, _curren
 
 logger = logging.getLogger(__name__)
 
-# dtype ↔ int mapping for broadcasting tensor dtypes.
-_DTYPE_TO_INT = {
-    torch.float32: 0,
-    torch.float16: 1,
-    torch.bfloat16: 2,
-    torch.float64: 3,
-    torch.int64: 4,
-    torch.int32: 5,
-    torch.int16: 6,
-    torch.int8: 7,
-    torch.uint8: 8,
-    torch.bool: 9,
-    torch.float8_e4m3fn: 10,
-    torch.float8_e5m2: 11,
-}
-_INT_TO_DTYPE = {v: k for k, v in _DTYPE_TO_INT.items()}
-
 StateDict = Dict[str, object]
 
 

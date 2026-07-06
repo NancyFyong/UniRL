@@ -117,16 +117,6 @@ class SGLangEngineConfig(BaseEngineConfig):
     # --- Parallelism & GPU ---
     tp_size: Optional[int] = None
 
-    # Set CUDA_VISIBLE_DEVICES to all node-local GPUs before booting SGLang so
-    # its TP schedulers can see them (mirrors slime's NOSET_CVD + base_gpu_id).
-    # Required for tp_size>1 in the colocate anchor layout.
-    clear_cuda_visible: bool = False
-
-    # Number of GPUs on the node. Used to set CUDA_VISIBLE_DEVICES to the full
-    # node-local GPU set before booting SGLang (slime derives this from
-    # args.num_gpus_per_node; UniRL passes it explicitly via the recipe).
-    num_node_gpus: int = 8
-
     # --- SGLang network ---
     # ``host`` is the SRT bind address (default 0.0.0.0 so the server accepts
     # cross-node connections). ``port`` is kept for config-shape parity with
@@ -270,11 +260,6 @@ class SGLangEngineConfig(BaseEngineConfig):
         intent.setdefault("host", "0.0.0.0")
         intent.setdefault("tp_size", 1)
         intent.setdefault("mem_fraction_static", 0.88)
-
-        # Non-ServerArgs escape-hatch keys consumed by NativeBackend/HTTPBackend
-        # before constructing the Engine / spawning the SRT subprocess.
-        intent["clear_cuda_visible"] = bool(self.clear_cuda_visible)
-        intent["num_node_gpus"] = int(self.num_node_gpus)
 
         return intent
 
