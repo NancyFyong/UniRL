@@ -8,7 +8,7 @@ visible. These are the integration gate for the colocate TP design:
   - ``generate`` only hits the tp_rank=0 backend
   - weight sync delivers full tensors to every TP rank via SGLang's NCCL group
 
-Run:  UNIRL_TP_GPU_TEST=1 pytest scripts/tests/test_rollout_tp_gpu_smoke.py
+Run:  UNIRL_TP_GPU_TEST=1 pytest scripts/tests/rollout/test_tp_smoke_gpu.py
 
 The minimal validation target (see docs/rollout_tp_ep_pp_design.md, Tier 1):
 1 node, 2 GPUs, ``tp_size=2``. Output must match the ``tp_size=1`` baseline
@@ -21,7 +21,7 @@ import os
 
 import pytest
 
-from .conftest import requires_gpus
+from ..conftest import requires_gpus
 
 
 @pytest.fixture
@@ -37,7 +37,6 @@ def test_tp2_engine_boot_and_generate(tp2_gate, tmp_path):
     GPU) and run manually before merging any rollout-TP change.
     """
     pytest.importorskip("sglang")
-    import torch
     from unirl.rollout.engine.sglang.config import SGLangEngineConfig
     from unirl.rollout.engine.sglang.engine import SGLangRolloutEngine
 

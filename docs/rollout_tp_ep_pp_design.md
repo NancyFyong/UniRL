@@ -126,7 +126,7 @@ def connect(self, *, master_addr, master_port, num_rollout_gpus, tp_size=1):
     num_engines = len(self._rollout_targets)  # 已过滤为 tp_rank==0
     world = num_engines * tp + 1
     refs = [
-        handle.call.remote(..., 
+        handle.call.remote(...,
             rank_offset=i * tp + 1,  # was i + 1
             world_size=world, ...)
         for i, handle in enumerate(self._rollout_targets)
@@ -138,7 +138,7 @@ def connect(self, *, master_addr, master_port, num_rollout_gpus, tp_size=1):
 2. **Driver-side 过滤**（G3 已解决）—— 两个调用点：
    - `unirl/trainer/async_ar.py:218-223`（AsyncARTrainer）
    - `unirl/trainer/diffusion.py:272-273`（DiffusionTrainer，NCCL 分支）
-   
+
    改为：
 ```python
 tp_size = self.rollout.rank_infos[0].tp_size

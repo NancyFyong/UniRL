@@ -19,15 +19,10 @@ PP (Pipeline Parallel):
     ``NotImplementedError`` — per-stage rank_offset routing is future work.
   - ``pp_size=1`` is the supported default and never raises.
 
-Run:  pytest scripts/tests/test_rollout_ep_pp.py
+Run:  pytest scripts/tests/rollout/test_ep_pp_on_cpu.py
 """
 
 from __future__ import annotations
-
-import sys
-import types
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -36,10 +31,10 @@ from unirl.distributed.group.handle import (
     _build_rank_infos,
     _parallel_shape_from_init_kwargs,
 )
-from unirl.distributed.group.remote import RankInfo
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
 from unirl.rollout.engine.sglang.engine import SGLangRolloutEngine
 
+from ..conftest import FakeRayHandle, make_nccl_sync
 
 PORTS = SGLangPorts(server_port=30000, nccl_port=30001)
 
@@ -98,8 +93,9 @@ def test_ep_does_not_change_rank_layout():
 
 
 def test_ep_does_not_change_nccl_rank_offset():
-    # NCCL rank_offset = engine_idx * tp_size + 1, independent of ep_size.
-    num_engines, tp, ep = 2, 2, 4
+    # NCCL rank_offset = engine_idx * tp_size + 1, independent of ep_size: the
+    # math below never references ep, which is exactly the invariant asserted.
+    num_engines, tp = 2, 2
     offsets = [i * tp + 1 for i in range(num_engines)]
     world = num_engines * tp + 1
     assert offsets == [1, 3]
@@ -107,9 +103,7 @@ def test_ep_does_not_change_nccl_rank_offset():
 
 
 def test_ep_composes_with_tp_in_shape_resolution():
-    sp, tp, pp, ep = _parallel_shape_from_init_kwargs(
-        {"config": {"tp_size": 2, "ep_size": 4}}, 4, SGLangRolloutEngine
-    )
+    sp, tp, pp, ep = _parallel_shape_from_init_kwargs({"config": {"tp_size": 2, "ep_size": 4}}, 4, SGLangRolloutEngine)
     assert (sp, tp, pp, ep) == (1, 2, 1, 4)
 
 
@@ -151,17 +145,12 @@ def test_pp2_dispatch_collect_filter_selects_tp0_last_stage():
     # is_pipeline_last_stage AND sp_rank==0. Under tp=2 pp=2 world=8, the
     # collected ranks are those with tp_rank==0 and pp_rank==1.
     r = _build_rank_infos(8, tp_size=2, pp_size=2)
-    collected = [
-        i for i, ri in enumerate(r)
-        if ri.tp_rank == 0 and ri.is_pipeline_last_stage and ri.sp_rank == 0
-    ]
+    collected = [i for i, ri in enumerate(r) if ri.tp_rank == 0 and ri.is_pipeline_last_stage and ri.sp_rank == 0]
     assert collected == [2, 6]  # one per DP group
 
 
 def test_pp_shape_resolution_from_sglang_config():
-    sp, tp, pp, ep = _parallel_shape_from_init_kwargs(
-        {"config": {"tp_size": 2, "pp_size": 2}}, 8, SGLangRolloutEngine
-    )
+    sp, tp, pp, ep = _parallel_shape_from_init_kwargs({"config": {"tp_size": 2, "pp_size": 2}}, 8, SGLangRolloutEngine)
     assert (sp, tp, pp, ep) == (1, 2, 2, 1)
 
 
@@ -175,67 +164,33 @@ def test_pp_world_must_divide_tp_times_pp():
 # --------------------------------------------------------------------------- #
 
 
-@dataclass
-class _FakeBackend:
-    rollout_adapter_name: str = "default"
-
-
-class _FakeRayHandle:
-    def __init__(self, name: str) -> None:
-        self.name = name
-        self.calls: List[Tuple[str, Tuple, Dict]] = []
-        self.call = self._Call(self)
-
-    class _Call:
-        def __init__(self, owner): self._o = owner
-        def remote(self, role_name, method_name, args, kwargs, **_):
-            self._o.calls.append((method_name, args, dict(kwargs)))
-            return _FakeRef()
-
-
-@dataclass
-class _FakeRef:
-    def __init__(self): pass
-
-
-def _nccl_for_test(monkeypatch):
-    """Build an NCCLWeightSync with ray/pg plumbing stubbed."""
-    monkeypatch.setattr(
-        "unirl.utils.distributed_utils.init_process_group", lambda **kw: ("pg",)
-    )
-    import ray
-    monkeypatch.setattr(ray, "get", lambda refs: None)
-    from unirl.distributed.weight_sync.full.nccl import NCCLWeightSync
-    sync = NCCLWeightSync.__new__(NCCLWeightSync)
-    sync._group_name = "g"
-    sync._model_update_group = None
-    sync._rollout_targets = []
-    sync._rollout_role = None
-    sync._track_prefix = ""
-    return sync
-
-
 def test_pp_size_gt1_connect_fails_closed(monkeypatch):
-    sync = _nccl_for_test(monkeypatch)
-    sync._rollout_targets = [_FakeRayHandle("e0")]
+    sync = make_nccl_sync(monkeypatch)
+    sync._rollout_targets = [FakeRayHandle("e0")]
     sync._rollout_role = "rollout"
     with pytest.raises(NotImplementedError, match="pp_size>1"):
         sync.connect.__wrapped__(
             sync,
-            master_addr="127.0.0.1", master_port=1234,
-            num_rollout_gpus=2, tp_size=1, pp_size=2,
+            master_addr="127.0.0.1",
+            master_port=1234,
+            num_rollout_gpus=2,
+            tp_size=1,
+            pp_size=2,
         )
 
 
 def test_pp_size_1_connect_does_not_raise(monkeypatch):
-    sync = _nccl_for_test(monkeypatch)
-    sync._rollout_targets = [_FakeRayHandle("e0"), _FakeRayHandle("e1")]
+    sync = make_nccl_sync(monkeypatch)
+    sync._rollout_targets = [FakeRayHandle("e0"), FakeRayHandle("e1")]
     sync._rollout_role = "rollout"
     # pp_size=1 is the supported default; must go through the normal path.
     sync.connect.__wrapped__(
         sync,
-        master_addr="127.0.0.1", master_port=1234,
-        num_rollout_gpus=2, tp_size=1, pp_size=1,
+        master_addr="127.0.0.1",
+        master_port=1234,
+        num_rollout_gpus=2,
+        tp_size=1,
+        pp_size=1,
     )
     all_calls = [c for h in sync._rollout_targets for c in h.calls]
     assert len(all_calls) == 2  # one init_weights_update_group per engine
@@ -243,13 +198,15 @@ def test_pp_size_1_connect_does_not_raise(monkeypatch):
 
 def test_pp_size_default_is_one(monkeypatch):
     # Omitting pp_size entirely must behave identically to pp_size=1.
-    sync = _nccl_for_test(monkeypatch)
-    sync._rollout_targets = [_FakeRayHandle("e0")]
+    sync = make_nccl_sync(monkeypatch)
+    sync._rollout_targets = [FakeRayHandle("e0")]
     sync._rollout_role = "rollout"
     sync.connect.__wrapped__(
         sync,
-        master_addr="127.0.0.1", master_port=1234,
-        num_rollout_gpus=1, tp_size=1,
+        master_addr="127.0.0.1",
+        master_port=1234,
+        num_rollout_gpus=1,
+        tp_size=1,
     )
     assert sync._rollout_targets[0].calls[0][2]["rank_offset"] == 1
 
@@ -264,7 +221,12 @@ def test_ep_pp_does_not_affect_tp_shell_guard():
     # guard keys on tp_rank alone, not ep/pp.
     cfg = _cfg(tp_size=2, ep_size=2, pp_size=1)
     eng = SGLangRolloutEngine(
-        config=cfg, rank=1, tp_rank=1, tp_size=2, tp_device_ids=[0, 1], ep_size=2,
+        config=cfg,
+        rank=1,
+        tp_rank=1,
+        tp_size=2,
+        tp_device_ids=[0, 1],
+        ep_size=2,
     )
     assert eng._is_tp_zero is False
     assert eng._backend is None
