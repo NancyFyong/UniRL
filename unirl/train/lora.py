@@ -34,11 +34,17 @@ def inject_lora(
     """Inject a single LoRA adapter.  No Shadow, no EMA."""
     from peft import LoraConfig, inject_adapter_in_model
 
+    # Support PEFT's "all-linear" wildcard (string, not list of chars)
+    if isinstance(target_modules, str):
+        tm = target_modules
+    else:
+        tm = list(target_modules)
+
     peft_cfg = LoraConfig(
         r=int(rank),
         lora_alpha=int(alpha),
         lora_dropout=float(dropout),
-        target_modules=list(target_modules),
+        target_modules=tm,
         bias=str(bias),
         task_type=str(task_type),
     )
