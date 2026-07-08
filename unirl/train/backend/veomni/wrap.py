@@ -85,6 +85,10 @@ def veomni_parallelize(
         enable=True,
         param_dtype=dtype_name,
         reduce_dtype="float32",
+        # Align with verl: use veomni default cast_forward_inputs=True.
+        # The model is already cast to master_t above; for LoRA (master=bf16)
+        # this is redundant but harmless. For fp32 master it ensures forward
+        # inputs match the bf16 compute dtype.
     )
     parallelize_model_fsdp2(
         model,
