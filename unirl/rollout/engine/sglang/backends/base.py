@@ -108,7 +108,12 @@ class Backend(Protocol):
         config_dict: Optional[dict] = None,
     ) -> None: ...
 
-    # update_from_ipc is intentionally absent — SGLang has no IPC receiver.
+    def update_from_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool = True,
+    ) -> None: ...
 
 
 __all__ = ["Backend", "RawResult"]
