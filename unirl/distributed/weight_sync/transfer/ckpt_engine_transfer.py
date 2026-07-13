@@ -94,12 +94,14 @@ class CkptEngineWeightSender:
                 buf_base = (gidx % 2) * self.bucket_size
                 tensor_offset = buf_base + offset
 
-                bucket_meta.append({
-                    "name": name,
-                    "shape": weight.shape,
-                    "dtype": weight.dtype,
-                    "offset": tensor_offset,
-                })
+                bucket_meta.append(
+                    {
+                        "name": name,
+                        "shape": weight.shape,
+                        "dtype": weight.dtype,
+                        "offset": tensor_offset,
+                    }
+                )
                 self.buffer[tensor_offset : tensor_offset + weight_nbytes].copy_(
                     weight.view(-1).view(torch.uint8), non_blocking=True
                 )
@@ -123,7 +125,7 @@ class CkptEngineWeightSender:
         """Create N REQ sockets, one per TP rank, each bound to its path."""
         for path in self.socket_paths:
             if path.startswith("ipc://"):
-                ipc_path = path[len("ipc://"):]
+                ipc_path = path[len("ipc://") :]
                 try:
                     os.remove(ipc_path)
                 except OSError:
@@ -163,8 +165,7 @@ class CkptEngineWeightSender:
             ack = sock.recv()
             if ack != b"":
                 raise RuntimeError(
-                    f"CkptEngineWeightSender: receiver {i} bucket load failed: "
-                    f"{ack.decode('utf-8', errors='replace')}"
+                    f"CkptEngineWeightSender: receiver {i} bucket load failed: {ack.decode('utf-8', errors='replace')}"
                 )
 
     def _send_none_to_all(self) -> None:
@@ -185,7 +186,7 @@ class CkptEngineWeightSender:
 
         for path in self.socket_paths:
             if path.startswith("ipc://"):
-                ipc_path = path[len("ipc://"):]
+                ipc_path = path[len("ipc://") :]
                 try:
                     os.remove(ipc_path)
                 except OSError:

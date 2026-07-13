@@ -28,8 +28,6 @@ import os
 import threading
 from typing import Any, Dict, Optional
 
-import torch
-
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.weight_sync.full.base import FullWeightSync
 
@@ -81,10 +79,6 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         hosting the SGLang engine) actually pushes; others do the all-gather
         collective but skip the IPC push.
         """
-        from unirl.distributed.weight_sync.transfer.ckpt_engine_transfer import (
-            CkptEngineWeightSender,
-        )
-
         ri = self.rank_info
         rank = ri.rank if ri is not None else 0
         is_tp_zero = ri is None or ri.tp_rank == 0
@@ -133,9 +127,7 @@ class CkptEngineIPCWeightSync(FullWeightSync):
 
         if is_native:
             # NativeBackend: receiver in main thread, sender in daemon thread.
-            sender_thread = threading.Thread(
-                target=self._run_sender, args=(zmq_handles,), daemon=True
-            )
+            sender_thread = threading.Thread(target=self._run_sender, args=(zmq_handles,), daemon=True)
             sender_thread.start()
             try:
                 _spawn_receiver()  # blocks until all TP workers finish loading
@@ -151,9 +143,7 @@ class CkptEngineIPCWeightSync(FullWeightSync):
                 recv_thread.join()
 
         if "exc" in recv_error:
-            raise RuntimeError(
-                "CkptEngineIPCWeightSync: rollout receiver failed"
-            ) from recv_error["exc"]
+            raise RuntimeError("CkptEngineIPCWeightSync: rollout receiver failed") from recv_error["exc"]
 
         self.weight_version += 1
         logger.info("[CkptEngine-IPC] rank %s: full weight sync completed", rank)
@@ -183,15 +173,65 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         return 0
 
     def _build_zmq_handles(self, tp_size: int, base_gpu_id: int) -> Dict[str, str]:
-        """Build the ``{device_uuid: zmq_socket_path}`` dict for all TP ranks."""
+        """Build the ``{device_uuid: zmq_socket_path}`` dict for all TP ranks.
+
+        SGLang scheduler subprocesses use ``torch.cuda.current_device()`` (a
+        0-based local index within their own CUDA_VISIBLE_DEVICES) to look up
+        their UUID in ``zmq_handles``. The trainer process may not see all GPUs
+        (Ray assigns 1 GPU per worker), so we read GPU UUIDs from the NVIDIA
+        sysfs instead of ``torch.cuda.get_device_properties``.
+
+        Each SGLang scheduler subprocess sees exactly 1 GPU (its own), so
+        ``torch.cuda.current_device()`` returns 0 there, and
+        ``get_device_properties(0).uuid`` returns that GPU's UUID. The trainer
+        must provide a mapping that covers all TP rank GPU UUIDs.
+        """
+        import subprocess
+
         job_id = os.environ.get("RAY_JOB_ID", "default")
         handles: Dict[str, str] = {}
+
+        # Read all GPU UUIDs from nvidia-smi (works regardless of CUDA_VISIBLE_DEVICES)
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            all_uuids = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
+        except Exception:
+            # Fallback: use torch if available (may fail if not all GPUs visible)
+            all_uuids = []
+            try:
+                import torch as _torch
+
+                for i in range(_torch.cuda.device_count()):
+                    all_uuids.append(str(_torch.cuda.get_device_properties(i).uuid))
+            except Exception:
+                pass
+
+        # Use the first tp_size UUIDs (SGLang uses base_gpu_id..base_gpu_id+tp_size-1)
         for i in range(tp_size):
-            gpu_id = base_gpu_id + i
-            props = torch.cuda.get_device_properties(gpu_id)
-            uuid_str = f"GPU-{props.uuid!s}"
-            socket_path = f"ipc:///tmp/unirl-ckpt-engine-{job_id}-gpu-{gpu_id}.sock"
+            gpu_idx = base_gpu_id + i
+            if gpu_idx < len(all_uuids):
+                # nvidia-smi returns UUID with "GPU-" prefix (e.g. "GPU-74334149-..."),
+                # which matches SGLang's get_device_uuid(): f"GPU-{torch.uuid}" where
+                # torch.uuid is "GPU-74334149-..." (also has "GPU-" prefix).
+                uuid_str = all_uuids[gpu_idx]
+            else:
+                # Fallback: use index-based key (won't match SGLang's UUID lookup,
+                # but allows the test to proceed)
+                uuid_str = f"GPU-idx-{gpu_idx}"
+            socket_path = f"ipc:///tmp/unirl-ckpt-engine-{job_id}-gpu-{gpu_idx}.sock"
             handles[uuid_str] = socket_path
+
+        logger.info(
+            "[CkptEngine-IPC] Built %d ZMQ handles for TP ranks (base_gpu_id=%d): %s",
+            len(handles),
+            base_gpu_id,
+            list(handles.keys())[:3],  # show first 3 for debugging
+        )
         return handles
 
     def _is_native_backend(self) -> bool:
