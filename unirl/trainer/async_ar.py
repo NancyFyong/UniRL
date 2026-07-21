@@ -43,6 +43,7 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
+from unirl.models.qwen3_5.validation import validate_qwen3_5_training_contract
 from unirl.rollout.async_runtime import (
     AsyncRolloutScheduler,
     BufferedRolloutGroup,
@@ -92,6 +93,12 @@ class AsyncARTrainer(ARTrainer):
         max_inflight: int = 1,
         buffer_max_staleness: Optional[int] = None,
     ) -> None:
+        validate_qwen3_5_training_contract(
+            pipeline_cfg=pipeline_cfg,
+            backend_cfg=backend_cfg,
+            rollout_cfg=rollout_cfg,
+            stack_cfg=stack_cfg,
+        )
         # Call BaseTrainer.__init__ directly: ARTrainer.__init__ opens the
         # colocate ``placement(fraction=1.0)`` block, which is exactly what we
         # must NOT run. (ARTrainer itself just calls BaseTrainer.__init__ here.)

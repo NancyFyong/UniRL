@@ -103,7 +103,12 @@ class VLMAdapter(TextLMAdapter):
         if system_instruction:
             messages.append({"role": "system", "content": system_instruction})
         messages.append({"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_prompt}]})
-        text = self._processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        template_kwargs: Dict[str, Any] = {
+            "add_generation_prompt": True,
+            "tokenize": False,
+        }
+        template_kwargs.update(self.cfg.chat_template_kwargs or {})
+        text = self._processor.apply_chat_template(messages, **template_kwargs)
         enc = self._processor(text=[text], images=[image], return_tensors="pt")
         return MMEncoding(
             image=image,
