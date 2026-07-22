@@ -22,11 +22,7 @@ import torch.nn as nn
 from packaging.version import Version
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import (
-    capture_init_state,
-    finalize_meta_init,
-    stamp_init_state_restore,
-)
+from unirl.models.types.meta_init import build_meta_init_transformer, capture_init_state
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import Qwen3_5PipelineConfig
@@ -172,8 +168,18 @@ class Qwen3_5Bundle(Bundle):
         if getattr(config, "attn_implementation", None):
             load_kwargs["attn_implementation"] = str(config.attn_implementation)
 
+        meta_init_state = None
         if config.meta_init_transformer:
             if model_type == "qwen3_5_moe":
+                # VeOmni owns the MoE meta build (EP plan, fused kernels) and
+                # constructs on init_device="meta" itself, so it cannot route
+                # through build_meta_init_transformer. Replicate that helper's
+                # finalize inline instead: capture init-computed non-persistent
+                # state (GDN conv/rope buffers absent from the checkpoint, else
+                # to_empty clobbers them), cast (metadata-only on meta), and stamp
+                # init_weights to a no-op so parallelize does not re-init after
+                # to_empty. capture_init_state requires buffers real on CPU, which
+                # VeOmni's meta build provides.
                 from veomni.arguments import OpsImplementationConfig
                 from veomni.models.auto import build_foundation_model
 
@@ -204,13 +210,11 @@ class Qwen3_5Bundle(Bundle):
                     init_device="meta",
                     ops_implementation=ops,
                 )
+                meta_init_state = capture_init_state(transformer)
+                transformer = transformer.to(dtype)
+                transformer.init_weights = lambda: None
             else:
-                from accelerate import init_empty_weights
-
-                with init_empty_weights(include_buffers=False):
-                    transformer = ModelCls(hf_config)
-            stamp_init_state_restore(transformer)
-            transformer = finalize_meta_init(transformer, dtype=dtype)
+                transformer, meta_init_state = build_meta_init_transformer(lambda: ModelCls(hf_config), dtype=dtype)
         else:
             transformer = ModelCls.from_pretrained(
                 path,
@@ -273,7 +277,11 @@ class Qwen3_5Bundle(Bundle):
         )
         if config.meta_init_transformer:
             bundle._transformer_weights_path = path
-            bundle._meta_init_state = capture_init_state(transformer)
+            # Ray-robust restore carrier for init-computed non-persistent state
+            # (captured above before to_empty; the transformer is now on meta, so
+            # recapturing here would fail). restore_init_state replays it in
+            # load_trainable_weights after the sharded weight load.
+            bundle._meta_init_state = meta_init_state
         return bundle
 
     def prepare_for_expert_parallel(self) -> None:
