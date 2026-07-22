@@ -50,7 +50,6 @@ def _replay_aware_forward(
     prompt_len: Optional[int] = None,
     temperature: float = 1.0,
     autocast_dtype: Optional[torch.dtype] = None,
-    packed_predict_index: Optional[torch.Tensor] = None,
     **kw: Any,
 ) -> Any:
     """Dual-mode ``forward`` installed on the Qwen3.5 ForConditionalGeneration.
@@ -79,30 +78,6 @@ def _replay_aware_forward(
         hidden = self.model(**kw, use_cache=False, return_dict=True).last_hidden_state  # [B, L, H]
 
     T = float(temperature) if float(temperature) > 0.0 else 1.0
-
-    if packed_predict_index is not None:
-        # Packed varlen path (currently unused — _SPARSE_PACKED_ATTN=() forces
-        # padding_replay — but kept for parity with Qwen3 so a future per-layer
-        # gate can re-enable it without touching the forward).
-        h_pred = hidden[0].index_select(0, packed_predict_index)
-        targets = response_tokens
-
-        def _flat_logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
-            lf = self.lm_head(h).float() / T
-            return lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(lf, dim=-1)
-
-        flat_parts: List[torch.Tensor] = []
-        flat_chunk = 2048
-        for s in range(0, int(h_pred.size(0)), flat_chunk):
-            h = h_pred[s : s + flat_chunk]
-            tok = targets[s : s + flat_chunk]
-            if torch.is_grad_enabled() and h.requires_grad:
-                flat_parts.append(checkpoint(_flat_logp_chunk, h, tok, use_reentrant=False))
-            else:
-                flat_parts.append(_flat_logp_chunk(h, tok))
-        if not flat_parts:
-            return hidden.new_zeros((0,), dtype=torch.float32)
-        return torch.cat(flat_parts, dim=0)
 
     T_max = int(response_tokens.size(1))
     resp_hidden = hidden[:, prompt_len - 1 : prompt_len - 1 + T_max, :]
@@ -398,12 +373,16 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
                 next_logits = next_logits.to(device)
 
             token_id, log_prob = step.step(next_logits)
+            # One device→host transfer per step (not per element): per-element
+            # .item() in this loop is O(B*N) blocking CUDA syncs.
+            token_list = token_id.tolist()
+            logp_list = log_prob.tolist()
             for b in range(batch_size):
                 if finished[b]:
                     continue
-                tid = int(token_id[b].item())
+                tid = int(token_list[b])
                 generated_tokens[b].append(tid)
-                per_token_logps[b].append(float(log_prob[b].item()))
+                per_token_logps[b].append(float(logp_list[b]))
                 if tid in stop_ids:
                     finished[b] = True
 
@@ -473,11 +452,32 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
         prompt_ids = prompt_ids[:, :max_real_len]
         prompt_mask = prompt_mask[:, :max_real_len]
 
+        pad_id = self.model.tokenizer.pad_token_id or 0
+
+        # Re-pad RIGHT→LEFT so every sample's real prompt ends at index
+        # ``max_real_len - 1`` and the response starts at ``max_real_len``.
+        # Cross-actor concat right-pads prompts to a global max; without
+        # re-padding, samples shorter than the batch max have pad tokens
+        # between prompt and response, the uniform ``resp_hidden`` slice at
+        # ``prompt_len - 1`` reads a pad-position hidden state, and response
+        # RoPE positions shift by ``max_real_len - n_real``. Mirrors
+        # Qwen3ARStage.replay's left re-pad block.
+        if int(real_lens.min().item()) < max_real_len:
+            left_padded_ids = torch.full_like(prompt_ids, pad_id)
+            left_padded_mask = torch.zeros_like(prompt_mask)
+            for b in range(batch_size):
+                n_real = int(real_lens[b].item())
+                if n_real == 0:
+                    continue
+                left_padded_ids[b, max_real_len - n_real :] = prompt_ids[b, :n_real]
+                left_padded_mask[b, max_real_len - n_real :] = 1
+            prompt_ids = left_padded_ids
+            prompt_mask = left_padded_mask
+
         self.model.transformer.model.rope_deltas = None
 
         lengths = [int(n) for n in segment.lengths.tolist()]
         T_max = max(lengths) if lengths else 0
-        pad_id = self.model.tokenizer.pad_token_id or 0
         response_tokens = torch.full((batch_size, T_max), pad_id, dtype=torch.long, device=device)
         response_mask = torch.zeros((batch_size, T_max), dtype=torch.long, device=device)
         cu = [int(c) for c in segment.cu_seqlens.tolist()]
@@ -488,28 +488,30 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
             response_tokens[b, :n] = segment.tokens[cu[b] : cu[b] + n].to(device=device, dtype=torch.long)
             response_mask[b, :n] = 1
 
+        # Response tokens are sampled text — but a sampled id may happen to equal
+        # image_token_id / video_token_id. The model's get_placeholder_mask
+        # counts image tokens from input_ids directly (not mm_token_type_ids),
+        # so any stray image_token_id in the response would make the count exceed
+        # the actual image features → "Image features and image tokens do not
+        # match". Scrub the collisions to pad_id in ``response_tokens`` BEFORE
+        # building ``full_ids`` so the forward input and the log-prob gather
+        # index stay consistent (scrubbing only ``full_ids`` would condition
+        # every later hidden state on pad while gathering the original id).
+        cfg = self.model.transformer.config
+        _resp_image_token_id = getattr(cfg, "image_token_id", None)
+        _resp_video_token_id = getattr(cfg, "video_token_id", None)
+        if T_max > 0 and (_resp_image_token_id is not None or _resp_video_token_id is not None):
+            if _resp_image_token_id is not None:
+                response_tokens[response_tokens == _resp_image_token_id] = pad_id
+            if _resp_video_token_id is not None:
+                response_tokens[response_tokens == _resp_video_token_id] = pad_id
+
         if T_max > 0:
             full_ids = torch.cat([prompt_ids, response_tokens], dim=1)
             full_mask = torch.cat([prompt_mask, response_mask], dim=1)
         else:
             full_ids = prompt_ids
             full_mask = prompt_mask
-
-        # Response tokens are sampled text — but a sampled id may happen to equal
-        # image_token_id / video_token_id. The model's get_placeholder_mask
-        # counts image tokens from input_ids directly (not mm_token_type_ids),
-        # so any stray image_token_id in the response would make the count exceed
-        # the actual image features → "Image features and image tokens do not
-        # match". Replace any such collisions in the response portion with pad_id.
-        cfg = self.model.transformer.config
-        _resp_image_token_id = getattr(cfg, "image_token_id", None)
-        _resp_video_token_id = getattr(cfg, "video_token_id", None)
-        if T_max > 0 and (_resp_image_token_id is not None or _resp_video_token_id is not None):
-            _resp_slice = full_ids[:, max_real_len:]
-            if _resp_image_token_id is not None:
-                _resp_slice[_resp_slice == _resp_image_token_id] = pad_id
-            if _resp_video_token_id is not None:
-                _resp_slice[_resp_slice == _resp_video_token_id] = pad_id
 
         # Build mm_token_type_ids from the PROMPT only. Response tokens are
         # sampled text and must be type 0 — but a sampled token id may happen

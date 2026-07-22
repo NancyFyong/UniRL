@@ -84,6 +84,36 @@ class Qwen3_5ChatTemplateStage:
                     "desynchronize image/video placeholder tokens from pixel_values or grids. "
                     "Increase pipeline.max_prompt_length or shorten the prompt."
                 )
+            if not has_media and prompt_len > self.max_prompt_length:
+                # Plain right-truncation would drop the trailing generation-prompt
+                # suffix ("<|im_start|>assistant\n", plus thinking tokens when
+                # enabled), leaving the model unprimed to open an assistant turn
+                # → degenerate/empty generations. Truncate the body but keep the
+                # suffix: re-tokenize without the generation prompt to measure the
+                # suffix, then splice head + suffix at max_prompt_length.
+                base = processor.apply_chat_template(
+                    messages,
+                    add_generation_prompt=False,
+                    enable_thinking=self.enable_thinking,
+                    tokenize=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                )
+                suffix_len = prompt_len - int(base["input_ids"].shape[-1])
+                if suffix_len < 0 or suffix_len >= self.max_prompt_length:
+                    raise ValueError(
+                        "Qwen3_5ChatTemplateStage.embed: cannot truncate prompt of "
+                        f"length {prompt_len} to max_prompt_length={self.max_prompt_length} "
+                        f"while preserving the generation-prompt suffix (suffix_len={suffix_len})."
+                    )
+                head = self.max_prompt_length - suffix_len
+                inputs["input_ids"] = torch.cat(
+                    [inputs["input_ids"][:, :head], inputs["input_ids"][:, prompt_len - suffix_len :]], dim=-1
+                )
+                inputs["attention_mask"] = torch.cat(
+                    [inputs["attention_mask"][:, :head], inputs["attention_mask"][:, prompt_len - suffix_len :]],
+                    dim=-1,
+                )
             per_sample_inputs.append(inputs)
 
         if self.pad_to_max_length:
