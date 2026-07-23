@@ -4,13 +4,10 @@
 # Integrated from Shredded-Pork/Flash-GRPO commit
 # bd6051f68e1ab444e5ec7c6ffe0a1f7eaf559a0d.
 #
-# Flash-GRPO = one-step FlowGRPO for video diffusion:
-#   1. FlashSDEStrategy uses the upstream transition coefficient
-#      std_dev_t = sigma_min + (sigma_max - sigma_min) * sigma.
-#   2. FlashGRPO applies upstream temporal-gradient rectification to the
-#      PPO/GRPO ratio-clip loss.
-#   3. The scheduler resolves exactly one SDE step from the first half of the
-#      denoising schedule; all other steps run deterministic Euler.
+# Non-Flash training/model/data hyperparameters mirror wan21_t2v.yaml.
+# FlashGRPO-specific overrides follow the upstream algorithm semantics:
+# FlashSDEStrategy, FlashGRPO loss, eta=1.0, clip_range=1e-3, and exactly one
+# SDE step sampled from the first half of the configured denoising schedule.
 #
 # The upstream repo trains with an HPSV3 video reward server. This UniRL recipe
 # keeps the existing in-repo video_pickscore reward so the example is runnable
@@ -52,11 +49,11 @@ backend:
     mixed_precision: true
     fsdp_mode: full
     reshard_after_forward: true
-    activation_checkpointing: true
+    activation_checkpointing: false  # deliberately off (speed); v1 used bf16_full_ac
     use_torch_compile: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
-    learning_rate: 1.0e-4
+    learning_rate: 3.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.999
     adam_epsilon: 1.0e-8
@@ -86,7 +83,7 @@ backend:
 rollout:
   _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
   stage_attrs: [diffusion]
-  forward_batch_size: 1
+  forward_batch_size: 4           # v1 rollout.plan.forward_batch_size (720p caps activation)
 
 reward:
   _target_: unirl.reward.service.RewardService
@@ -106,9 +103,9 @@ algorithm:
   clip_range: 1.0e-3
   clip_schedule: constant
   old_logp_source: replay
-  # Normalize the single sampled step by the same candidate pool upstream
-  # uses: one of the first 10 steps in a 20-step trajectory.
-  rectification_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  # Normalize the single sampled step by the same first-half candidate pool
+  # used by the Flash-GRPO scheduler below (14 base steps -> indices 0..6).
+  rectification_indices: [0, 1, 2, 3, 4, 5, 6]
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.wan21.conditions.WAN21Conditions
@@ -132,25 +129,21 @@ data_source:
 
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
-  num_inference_steps: 20
-  guidance_scale: 4.5
-  height: 480
-  width: 832
-  num_frames: 81
+  num_inference_steps: 14         # wan21_t2v.yaml base setting
+  guidance_scale: 1.0
+  height: 720
+  width: 1280
+  num_frames: 5                   # (num_frames-1)%4==0 required
   # Upstream Flash-GRPO has no eta knob in its sde_step; eta=1 matches it.
   eta: 1.0
-  # Upstream sets config.sample.num_image_per_prompt=4 for its distributed
-  # repeated-prompt sampler, but the WAN generation call hardcodes
-  # num_videos_per_prompt=2. UniRL samples_per_prompt is the actual rollout
-  # fan-out/group size, so use the generation fan-out here.
-  samples_per_prompt: 2
+  samples_per_prompt: 16
   seed: 42
   init_same_noise: false
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
-    # Upstream picks one of the first 10/20 steps.
     timestep_fraction: [0.0, 0.5]
+    # FlashGRPO trains exactly one stochastic transition; all other steps are ODE.
     num_sde_steps: 1
 
 logging:

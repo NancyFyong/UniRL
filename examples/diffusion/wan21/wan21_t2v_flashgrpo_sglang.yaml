@@ -6,18 +6,16 @@
 # strategy.canonical_name="flash" and the UniRL hijack installs a matching
 # engine-side Flash SDE transition kernel.
 #
-# The upstream Flash-GRPO recipe uses 20 denoising steps, one sampled SDE step
-# from the first half of the schedule, guidance_scale=4.5, 480x832, 81 frames,
-# lr=1e-4, clip_range=1e-3. This recipe keeps those algorithm/sampling knobs and
-# adds the dedicated-engine pieces SGLang needs: shared model_config/strategy,
-# SGLang LoRA targets, prompt-embedding condition capture, and LoRA weight sync.
+# Non-Flash training/model/data/SGLang hyperparameters mirror
+# wan21_t2v_sglang.yaml. FlashGRPO-specific overrides follow the upstream
+# algorithm semantics: FlashSDEStrategy, FlashGRPO loss, eta=1.0,
+# clip_range=1e-3, and exactly one SDE step sampled from the first half of the
+# configured denoising schedule.
 #
 #   1x8:  bash examples/run_experiment_single_node.sh diffusion/wan21/wan21_t2v_flashgrpo_sglang
 
 num_devices: 8
-# Follow the SGLang WAN recipe's smaller logical prompt batch, then layer the
-# Flash-GRPO per-prompt group size below.
-batch_size: 8
+batch_size: 8                 # prompts_per_rollout (small for the sglang video smoke)
 adv_use_global_std: true
 num_rollouts: 1000
 weight_sync_interval: 1
@@ -66,11 +64,11 @@ backend:
     mixed_precision: true
     fsdp_mode: full
     reshard_after_forward: true
-    activation_checkpointing: true
+    activation_checkpointing: false
     use_torch_compile: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
-    learning_rate: 1.0e-4
+    learning_rate: 3.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.999
     adam_epsilon: 1.0e-8
@@ -104,9 +102,9 @@ rollout:
     model_family: wan21
     populate_conditions: true
     init_same_noise: ${sampling.init_same_noise}
-    # 81-frame video rollouts are heavy; keep this conservative and override
-    # upward only after checking memory on the target SGLang build.
-    forward_batch_size: 2
+    # Chunk generate into sub-batches so sglang bounds its DiT-forward / VAE-decode
+    # peak memory (video latents are heavy); without shrinking the logical batch.
+    forward_batch_size: 8
     num_gpus: 1
     tp_size: 1
     local_mode: true
@@ -137,7 +135,8 @@ algorithm:
   clip_schedule: constant
   # Start with replay anchors until SGLang native Flash log-prob parity is tested.
   old_logp_source: replay
-  rectification_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  # Match the first-half candidate pool of wan21_t2v_sglang.yaml's 10-step schedule.
+  rectification_indices: [0, 1, 2, 3, 4]
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.wan21.conditions.WAN21Conditions
@@ -161,28 +160,20 @@ data_source:
 
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
-  num_inference_steps: 20
-  guidance_scale: 4.5
+  num_inference_steps: 10
+  guidance_scale: 1.0          # no CFG -> no negative-prompt branch
   height: 480
   width: 832
-  num_frames: 81
+  num_frames: 5                # (num_frames-1)%4==0 required -> 2 latent frames
   eta: 1.0
-  # Upstream sets config.sample.num_image_per_prompt=4 for its distributed
-  # repeated-prompt sampler, but the WAN generation call hardcodes
-  # num_videos_per_prompt=2. UniRL samples_per_prompt is the actual rollout
-  # fan-out/group size, so use the generation fan-out here.
-  samples_per_prompt: 2
+  samples_per_prompt: 8
   seed: 42
   init_same_noise: false
-  # SGLang must return the same empty-string negative branch that trainside WAN
-  # replay encodes when guidance_scale > 1.
-  sampler_kwargs:
-    negative_prompt: ""
-    return_negative_prompt_embeds: true
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     timestep_fraction: [0.0, 0.5]
+    # FlashGRPO trains exactly one stochastic transition; all other steps are ODE.
     num_sde_steps: 1
 
 sync:
