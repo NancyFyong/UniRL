@@ -167,9 +167,11 @@ sampling:
   width: 832
   num_frames: 81
   eta: 1.0
-  # Match upstream Flash-GRPO num_image_per_prompt=4 while keeping SGLang
-  # video rollout smaller than the trainside recipe: 8 prompts × 4 samples.
-  samples_per_prompt: 4
+  # Upstream sets config.sample.num_image_per_prompt=4 for its distributed
+  # repeated-prompt sampler, but the WAN generation call hardcodes
+  # num_videos_per_prompt=2. UniRL samples_per_prompt is the actual rollout
+  # fan-out/group size, so use the generation fan-out here.
+  samples_per_prompt: 2
   seed: 42
   init_same_noise: false
   # SGLang must return the same empty-string negative branch that trainside WAN
