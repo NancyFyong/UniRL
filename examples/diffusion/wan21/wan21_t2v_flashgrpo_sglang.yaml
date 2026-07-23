@@ -6,13 +6,13 @@
 # strategy.canonical_name="flash" and the UniRL hijack installs a matching
 # engine-side Flash SDE transition kernel.
 #
-# Non-Flash training/model/data/SGLang hyperparameters mirror
-# wan21_t2v_sglang.yaml. FlashGRPO-specific overrides follow the upstream
-# algorithm semantics: FlashSDEStrategy, FlashGRPO loss, eta=1.0,
-# clip_range=1e-3, one SDE step from the first half of the configured schedule,
-# and the effective prompt group size. Upstream WAN uses
-# DistributedKRepeatSampler(k=4) and hardcoded num_videos_per_prompt=2, so
-# UniRL's actual per-prompt fan-out is 4*2=8.
+# Non-Flash training/model/data/SGLang engine hyperparameters mirror
+# wan21_t2v_sglang.yaml. FlashGRPO-specific overrides follow the upstream WAN
+# sampling/training semantics: 20 denoising steps, CFG 4.5, 480x832, 81 frames,
+# FlashSDEStrategy, FlashGRPO loss, eta=1.0, clip_range=1e-3, one SDE step
+# from the first half of the schedule, and the effective prompt group size.
+# Upstream WAN uses DistributedKRepeatSampler(k=4) and hardcoded
+# num_videos_per_prompt=2, so UniRL's actual per-prompt fan-out is 4*2=8.
 #
 #   1x8:  bash examples/run_experiment_single_node.sh diffusion/wan21/wan21_t2v_flashgrpo_sglang
 
@@ -137,8 +137,9 @@ algorithm:
   clip_schedule: constant
   # Start with replay anchors until SGLang native Flash log-prob parity is tested.
   old_logp_source: replay
-  # Match the first-half candidate pool of wan21_t2v_sglang.yaml's 10-step schedule.
-  rectification_indices: [0, 1, 2, 3, 4]
+  # Normalize the single sampled step by the same candidate pool upstream
+  # uses: one of the first 10 steps in a 20-step trajectory.
+  rectification_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.wan21.conditions.WAN21Conditions
@@ -162,16 +163,22 @@ data_source:
 
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
-  num_inference_steps: 10
-  guidance_scale: 1.0          # no CFG -> no negative-prompt branch
+  # Upstream WAN Flash-GRPO sampling settings.
+  num_inference_steps: 20
+  guidance_scale: 4.5
   height: 480
   width: 832
-  num_frames: 5                # (num_frames-1)%4==0 required -> 2 latent frames
+  num_frames: 81
   eta: 1.0
   # Effective upstream group size: num_image_per_prompt(4) * num_videos_per_prompt(2).
   samples_per_prompt: 8
   seed: 42
   init_same_noise: false
+  # SGLang must return the same empty-string negative branch that trainside WAN
+  # replay encodes when guidance_scale > 1.
+  sampler_kwargs:
+    negative_prompt: ""
+    return_negative_prompt_embeds: true
   scheduler:
     _target_: unirl.utils.scheduler_utils.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
