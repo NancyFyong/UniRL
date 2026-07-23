@@ -6,8 +6,10 @@
 #
 # Non-Flash training/model/data hyperparameters mirror wan21_t2v.yaml.
 # FlashGRPO-specific overrides follow the upstream algorithm semantics:
-# FlashSDEStrategy, FlashGRPO loss, eta=1.0, clip_range=1e-3, and exactly one
-# SDE step sampled from the first half of the configured denoising schedule.
+# FlashSDEStrategy, FlashGRPO loss, eta=1.0, clip_range=1e-3, one SDE step from
+# the first half of the configured schedule, and the effective prompt group size.
+# Upstream WAN uses DistributedKRepeatSampler(k=4) and hardcoded
+# num_videos_per_prompt=2, so UniRL's actual per-prompt fan-out is 4*2=8.
 #
 # The upstream repo trains with an HPSV3 video reward server. This UniRL recipe
 # keeps the existing in-repo video_pickscore reward so the example is runnable
@@ -136,7 +138,8 @@ sampling:
   num_frames: 5                   # (num_frames-1)%4==0 required
   # Upstream Flash-GRPO has no eta knob in its sde_step; eta=1 matches it.
   eta: 1.0
-  samples_per_prompt: 16
+  # Effective upstream group size: num_image_per_prompt(4) * num_videos_per_prompt(2).
+  samples_per_prompt: 8
   seed: 42
   init_same_noise: false
   scheduler:
