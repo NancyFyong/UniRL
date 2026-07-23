@@ -15,7 +15,9 @@
 #   1x8:  bash examples/run_experiment_single_node.sh diffusion/wan21/wan21_t2v_flashgrpo_sglang
 
 num_devices: 8
-batch_size: 48
+# Follow the SGLang WAN recipe's smaller logical prompt batch, then layer the
+# Flash-GRPO per-prompt group size below.
+batch_size: 8
 adv_use_global_std: true
 num_rollouts: 1000
 weight_sync_interval: 1
@@ -165,7 +167,9 @@ sampling:
   width: 832
   num_frames: 81
   eta: 1.0
-  samples_per_prompt: 2
+  # Match upstream Flash-GRPO num_image_per_prompt=4 while keeping SGLang
+  # video rollout smaller than the trainside recipe: 8 prompts × 4 samples.
+  samples_per_prompt: 4
   seed: 42
   init_same_noise: false
   # SGLang must return the same empty-string negative branch that trainside WAN

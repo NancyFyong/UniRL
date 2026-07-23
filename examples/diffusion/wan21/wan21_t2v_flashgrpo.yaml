@@ -18,7 +18,9 @@
 # service if needed.
 
 num_devices: 8
-batch_size: 48
+# Flash-GRPO upstream uses num_image_per_prompt=4 and 96 generated videos per
+# 1-node sampling epoch. In UniRL that maps cleanly to 24 prompts × 4 samples.
+batch_size: 24
 adv_use_global_std: true
 num_rollouts: 1000
 
@@ -139,7 +141,10 @@ sampling:
   num_frames: 81
   # Upstream Flash-GRPO has no eta knob in its sde_step; eta=1 matches it.
   eta: 1.0
-  samples_per_prompt: 2
+  # Match upstream Flash-GRPO num_image_per_prompt=4; GRPO groups four
+  # videos under each prompt while keeping total samples/rollout at 96 via
+  # batch_size=24 above.
+  samples_per_prompt: 4
   seed: 42
   init_same_noise: false
   scheduler:
