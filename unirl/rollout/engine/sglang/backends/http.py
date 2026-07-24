@@ -37,6 +37,11 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from unirl.rollout.engine.sglang.backends.base import (
+    _normalize_cuda_visible_devices,
+    _scheduler_spawn_environment,
+)
+
 try:
     import httpx
 except ImportError:  # pragma: no cover - exercised only when httpx is missing
@@ -237,6 +242,7 @@ class HTTPBackend:
         advertise_host: str,
         concurrency: int,
         health_timeout_s: float = 300.0,
+        cuda_visible_devices: Optional[Sequence[str]] = None,
     ) -> "HTTPBackend":
         """Filter intent against ServerArgs, spawn the SRT server, await health.
 
@@ -292,9 +298,22 @@ class HTTPBackend:
         # Forcing matches the predecessor so torch CUDA init in the child
         # happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
+
         server_args = rt["ServerArgs"](**server_kwargs)
+
+        tp_size = int(server_kwargs.get("tp_size", 1))
+        visible_devices = _normalize_cuda_visible_devices(
+            cuda_visible_devices,
+            tp_size=tp_size,
+        )
+        if visible_devices is not None:
+            # The restricted list is re-indexed to logical ordinals 0..TP-1.
+            server_args.base_gpu_id = 0
         process = multiprocessing.Process(target=rt["launch_server"], args=(server_args,))
-        process.start()
+        # The server child captures the clean library path and CUDA tokens at
+        # start; the Ray Worker's environment is restored immediately after.
+        with _scheduler_spawn_environment(visible_devices):
+            process.start()
 
         base_url = f"http://{advertise_host}:{server_kwargs['port']}"
         wait_server_healthy(
@@ -626,7 +645,17 @@ class HTTPBackend:
         accepts serialized LoRA tensors + a PEFT config dict and hot-loads the
         adapter on all TP workers internally.
         """
-        serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors, output_str=True)
+        # Serialize with plain pickle instead of ForkingPickler to avoid
+        # resource_sharer fd handles that race across TP>1 scheduler subprocesses.
+        # SafeUnpickler (used by SGLang for deserialization) handles plain pickle
+        # CPU tensors correctly — the tensor data is inlined, no fd passing.
+        import base64 as _base64
+        import io as _io
+        import pickle as _pickle
+
+        buf = _io.BytesIO()
+        _pickle.dump(lora_tensors, buf)
+        serialized = _base64.b64encode(buf.getvalue()).decode("utf-8")
         self._post_struct(
             "/load_lora_adapter_from_tensors",
             self._rt["LoadLoRAAdapterFromTensorsReqInput"](

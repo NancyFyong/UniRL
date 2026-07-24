@@ -2,8 +2,10 @@
 
 Every ``sglang`` collaborator reaches the SGLang SRT runtime through this
 protocol; the real implementation lives beside it (``http.py`` — SRT server
-subprocess + HTTP). This module holds no runtime code at all, so it is trivially
-CPU-importable.
+subprocess + HTTP). This module also owns the small, CPU-only environment guard
+shared by both spawn implementations. Keeping that mutation scoped to the
+child-spawn boundary prevents a Ray Worker from leaking its daemon's stale CUDA
+library path into SGLang scheduler children.
 
 **No RL types cross this seam.** ``generate`` takes ready-to-POST ``/generate``
 payload dicts (one per prompt) and returns ``list[RawResult]`` (a structural view
@@ -24,15 +26,77 @@ Deliberate divergences from the ``sglang_diffusion`` seam:
 
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
 from typing import (
     Any,
     Dict,
+    Iterator,
     List,
     Optional,
     Protocol,
     Sequence,
     runtime_checkable,
 )
+
+
+def _normalize_cuda_visible_devices(
+    cuda_visible_devices: Optional[Sequence[str]],
+    *,
+    tp_size: int,
+) -> Optional[List[str]]:
+    """Validate explicit scheduler CUDA tokens without interpreting them.
+
+    Ray may expose numeric ordinals, GPU UUIDs, or MIG UUIDs. They are opaque
+    tokens here; only cardinality and comma/empty ambiguity are rejected.
+    ``None`` means preserve the Worker's existing CUDA visibility.
+    """
+    if cuda_visible_devices is None:
+        return None
+    tokens = [str(token).strip() for token in cuda_visible_devices]
+    if len(tokens) != int(tp_size):
+        raise ValueError(
+            "SGLang scheduler CUDA visibility must contain exactly tp_size "
+            f"tokens; got tp_size={tp_size}, tokens={tokens!r}"
+        )
+    if any(not token for token in tokens):
+        raise ValueError(f"SGLang scheduler CUDA visibility contains an empty token: {tokens!r}")
+    if any("," in token for token in tokens):
+        raise ValueError(
+            f"SGLang scheduler CUDA visibility expects one token per entry; comma-containing entry found in {tokens!r}"
+        )
+    return tokens
+
+
+@contextmanager
+def _scheduler_spawn_environment(
+    cuda_visible_devices: Optional[Sequence[str]],
+) -> Iterator[None]:
+    """Quarantine environment changes to the SGLang child-spawn boundary.
+
+    Ray Workers inherit environment variables from the already-running Ray
+    daemon, not from the command that later submits a job. In particular, a
+    stale ``LD_LIBRARY_PATH`` can point at a different CUDA toolkit and make a
+    scheduler fail to load the runtime bundled with the active Python env.
+    Children therefore inherit no ``LD_LIBRARY_PATH``. The Worker's values are
+    restored on both success and failure, so colocated training is unaffected.
+    """
+    saved_ld_library_path = os.environ.get("LD_LIBRARY_PATH")
+    saved_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ.pop("LD_LIBRARY_PATH", None)
+    if cuda_visible_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(cuda_visible_devices)
+    try:
+        yield
+    finally:
+        if saved_ld_library_path is None:
+            os.environ.pop("LD_LIBRARY_PATH", None)
+        else:
+            os.environ["LD_LIBRARY_PATH"] = saved_ld_library_path
+        if saved_cuda_visible_devices is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = saved_cuda_visible_devices
 
 
 class RawResult(Protocol):

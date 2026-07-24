@@ -41,6 +41,10 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
+from unirl.rollout.engine.sglang.backends.base import (
+    _normalize_cuda_visible_devices,
+    _scheduler_spawn_environment,
+)
 from unirl.rollout.engine.sglang.backends.http import parse_generate_response
 
 logger = logging.getLogger(__name__)
@@ -137,6 +141,7 @@ class NativeBackend:
         server_intent: Dict[str, Any],
         *,
         concurrency: int,
+        cuda_visible_devices: Optional[Sequence[str]] = None,
     ) -> "NativeBackend":
         """Filter intent against ServerArgs, construct the in-process Engine.
 
@@ -187,7 +192,22 @@ class NativeBackend:
         # ``set_start_method`` is process-global; matches the HTTP impl so
         # torch CUDA init in the scheduler children happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
-        engine = rt["Engine"](**engine_kwargs)
+
+        # A colocated TP engine needs every member Worker's actual Ray CUDA
+        # token visible to its scheduler children. DevicePool ids are
+        # cluster-global and cannot safely be converted to local ordinals.
+        # With no explicit list (the TP=1/standalone path), preserve the
+        # Worker's existing CUDA visibility.
+        tp_size = int(engine_kwargs.get("tp_size", 1))
+        visible_devices = _normalize_cuda_visible_devices(
+            cuda_visible_devices,
+            tp_size=tp_size,
+        )
+        if visible_devices is not None:
+            # The restricted list is re-indexed to logical ordinals 0..TP-1.
+            engine_kwargs["base_gpu_id"] = 0
+        with _scheduler_spawn_environment(visible_devices):
+            engine = rt["Engine"](**engine_kwargs)
 
         # Bind-mapping gate twin: the settled ServerArgs must echo the
         # reserved ports verbatim — a runtime upgrade that silently re-settles
@@ -443,7 +463,17 @@ class NativeBackend:
         this server-side).
         """
         self._require_alive("set_lora")
-        serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors, output_str=True)
+        # Serialize with plain pickle instead of ForkingPickler to avoid
+        # resource_sharer fd handles that race across TP>1 scheduler subprocesses.
+        # SafeUnpickler (used by SGLang for deserialization) handles plain pickle
+        # CPU tensors correctly — the tensor data is inlined, no fd passing.
+        import base64 as _base64
+        import io as _io
+        import pickle as _pickle
+
+        buf = _io.BytesIO()
+        _pickle.dump(lora_tensors, buf)
+        serialized = _base64.b64encode(buf.getvalue()).decode("utf-8")
         obj = self._rt["LoadLoRAAdapterFromTensorsReqInput"](
             lora_name=str(lora_name),
             config_dict=dict(config_dict or {}),
