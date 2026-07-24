@@ -144,6 +144,14 @@ class SGLangEngineConfig(BaseEngineConfig):
     # --- Concurrency / async ---
     concurrency: int = 8
 
+    # --- Colocated memory lifecycle ---
+    # Optional so existing SGLang recipes retain upstream ServerArgs defaults.
+    # Colocated trainers opt in explicitly when they need sleep/wake to hand
+    # GPU ownership between rollout and FSDP.
+    enable_memory_saver: Optional[bool] = None
+    enable_weights_cpu_backup: Optional[bool] = None
+    skip_server_warmup: Optional[bool] = None
+
     # --- Sample expansion contract ---
     # VLMTrainer pre-expands the request by samples_per_prompt (P prompts → P*N
     # entries, one per GRPO sibling), so the engine must emit exactly ONE
@@ -316,6 +324,12 @@ class SGLangEngineConfig(BaseEngineConfig):
             intent["dp_size"] = int(self.dp_size)
         if self.enable_expert_parallel is not None:
             intent["enable_expert_parallel"] = bool(self.enable_expert_parallel)
+        if self.enable_memory_saver is not None:
+            intent["enable_memory_saver"] = bool(self.enable_memory_saver)
+        if self.enable_weights_cpu_backup is not None:
+            intent["enable_weights_cpu_backup"] = bool(self.enable_weights_cpu_backup)
+        if self.skip_server_warmup is not None:
+            intent["skip_server_warmup"] = bool(self.skip_server_warmup)
         if self.host is not None:
             intent["host"] = str(self.host)
 

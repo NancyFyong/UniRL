@@ -41,6 +41,7 @@ def main(cfg: DictConfig) -> None:
         adv_normalization_scope=cfg.get("adv_normalization_scope", "group"),
         normalize_adv_by_std=cfg.get("normalize_adv_by_std", True),
         balance_shards=cfg.get("balance_shards", False),
+        enable_fsdp_offload=cfg.get("enable_fsdp_offload", False),
         eval_interval=cfg.get("eval_interval", 0),
         eval_num_prompts=cfg.get("eval_num_prompts", -1),
         eval_batch_size=cfg.get("eval_batch_size", 8),
