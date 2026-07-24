@@ -93,6 +93,7 @@ def _import_sglang_engine() -> Dict[str, Any]:
     from sglang.srt.entrypoints.engine import Engine
     from sglang.srt.managers.io_struct import (
         LoadLoRAAdapterFromTensorsReqInput,
+        UpdateWeightsFromIPCReqInput,
         UpdateWeightsFromTensorReqInput,
     )
     from sglang.srt.server_args import ServerArgs
@@ -103,6 +104,7 @@ def _import_sglang_engine() -> Dict[str, Any]:
         "ServerArgs": ServerArgs,
         "MultiprocessingSerializer": MultiprocessingSerializer,
         "UpdateWeightsFromTensorReqInput": UpdateWeightsFromTensorReqInput,
+        "UpdateWeightsFromIPCReqInput": UpdateWeightsFromIPCReqInput,
         "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput,
     }
 
@@ -114,6 +116,8 @@ def _import_sglang_engine() -> Dict[str, Any]:
 
 class NativeBackend:
     """The native ``Backend`` impl over an in-process ``sglang.Engine``."""
+
+    requires_main_thread_ipc_receiver = True
 
     def __init__(
         self,
@@ -427,6 +431,26 @@ class NativeBackend:
         self._require_alive("destroy_weights_group")
         result = self._engine.destroy_weights_update_group(group_name=str(group_name))
         self._check_result(result, "destroy_weights_group")
+
+    def update_from_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool = True,
+    ) -> None:
+        """Update weights via ZMQ + CUDA IPC (checkpoint_engine protocol).
+
+        Calls SGLang's public ``Engine.update_weights_from_ipc``, which fans
+        the ``zmq_handles`` dict to all scheduler subprocesses. Each scheduler
+        looks up its GPU UUID, creates a REP socket, and receives weights from
+        the trainer's REQ socket. Blocks until all TP workers finish loading.
+        """
+        self._require_alive("update_from_ipc")
+        result = self._engine.update_weights_from_ipc(
+            zmq_handles=zmq_handles,
+            flush_cache=flush_cache,
+        )
+        self._check_result(result, "update_from_ipc")
 
     def set_lora(
         self,
