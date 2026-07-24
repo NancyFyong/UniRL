@@ -128,6 +128,11 @@ class RawResult(Protocol):
 class Backend(Protocol):
     """The seam every ``sglang`` collaborator reaches the runtime through."""
 
+    # ``NativeBackend.update_from_ipc`` drives the engine event loop and must
+    # run on the engine-owning thread. HTTP transport is thread-safe. Weight
+    # sync uses this capability instead of coupling to concrete class names.
+    requires_main_thread_ipc_receiver: bool
+
     # generation
     def generate(self, requests: List[Dict[str, Any]]) -> List[RawResult]: ...
     # memory / lifecycle / health
@@ -172,7 +177,12 @@ class Backend(Protocol):
         config_dict: Optional[dict] = None,
     ) -> None: ...
 
-    # update_from_ipc is intentionally absent — SGLang has no IPC receiver.
+    def update_from_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool = True,
+    ) -> None: ...
 
 
 __all__ = ["Backend", "RawResult"]

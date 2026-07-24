@@ -457,8 +457,26 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             return False
         return self._weight_sync.lora_dirty
 
-    # ``update_weights_from_ipc`` is deliberately NOT defined — the base raises
-    # NotImplementedError (SGLang has no bucketed-IPC receiver).
+    # ``update_weights_from_ipc`` — SGLang's checkpoint_engine IPC path (zero-copy).
+    # Uses a different signature from the base class (zmq_handles/flush_cache
+    # vs peft_config/base_sync_done/use_shm) because the checkpoint_engine
+    # protocol is fundamentally different from vLLM-Omni's bucketed IPC.
+
+    def update_weights_from_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool = True,
+        track_prefix: str = "",
+    ) -> None:
+        """Update weights via ZMQ + CUDA IPC (checkpoint_engine protocol)."""
+        del track_prefix
+        if not self._is_tp_zero:
+            return
+        self._weight_sync.update_weights_from_ipc(
+            zmq_handles=zmq_handles,
+            flush_cache=flush_cache,
+        )
 
 
 __all__ = ["SGLangRolloutEngine"]
