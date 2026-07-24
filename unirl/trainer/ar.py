@@ -53,6 +53,7 @@ class ARTrainer(BaseTrainer):
         adv_normalization_scope: str = "group",
         normalize_adv_by_std: bool = True,
         balance_shards: bool = False,
+        enable_fsdp_offload: bool = False,
         eval_interval: int = 0,
         eval_num_prompts: int = -1,
         eval_batch_size: int = 8,
@@ -73,6 +74,10 @@ class ARTrainer(BaseTrainer):
         # rank's pace — without balancing, the rank that drew the longest
         # sequences straggles (~+/-11%% rank-total variance at heavy lengths).
         self.balance_shards = bool(balance_shards)  # overrides the BaseTrainer default (False)
+        # A separate colocated rollout engine can use the GPU while the FSDP
+        # parameters, gradients, and optimizer state are parked on CPU. The
+        # weight sync still runs first because it needs the train model live.
+        self._enable_fsdp_offload = bool(enable_fsdp_offload)
         # AIME-style periodic eval — avg@k accuracy on the eval prompt set
         # (run.eval_data_path), logged under eval/*. eval_interval=0 disables it.
         # ``eval_num_prompts`` sentinel:
@@ -96,24 +101,136 @@ class ARTrainer(BaseTrainer):
 
         # Set below from the `sync` block; None trainside (shares the module).
         self.weight_sync = None
+        self._supports_staged_wake = False
 
-        with placement(self.pool, fraction=1.0, shared_workers=True):
-            self.bundle = remote_hydra(bundle_cfg)
-            self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
-            self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
+        # SGLang sizes its fixed KV-cache pool while it boots. For a separate
+        # colocated engine, release FSDP before that boot so the pool reflects
+        # rollout-phase capacity rather than the temporarily resident train state.
+        bootstrap_offload = sync_cfg is not None and self._enable_fsdp_offload
+        bootstrap_offloaded = False
+        rollout_boot_started = False
+        rollout_constructed = False
+        rollout_sleep_attempted = False
+        rollout_memory_released = False
+        try:
+            with placement(self.pool, fraction=1.0, shared_workers=True):
+                self.bundle = remote_hydra(bundle_cfg)
+                self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
+                self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
 
-            rollout_parsed = parse_hydra_cfg(rollout_cfg)
-            if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
-                self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)  # for direct sampling
+                if bootstrap_offload:
+                    try:
+                        self.backend.offload()
+                        bootstrap_offloaded = True
+                    except BaseException:
+                        # No rollout engine exists yet, so restoring FSDP is safe.
+                        self.backend.onload()
+                        raise
+
+                rollout_parsed = parse_hydra_cfg(rollout_cfg)
+                self._supports_staged_wake = "tags" in inspect.signature(rollout_parsed["role_cls"].wake_up).parameters
+                rollout_boot_started = True
+                if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
+                    self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)  # for direct sampling
+                else:
+                    self.rollout = remote(**rollout_parsed)  # for vllm / sglang
+                rollout_constructed = True
+
+                self.reward = remote_hydra(reward_cfg)
+                self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
+                self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
+
+                if sync_cfg is not None:
+                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
+
+            # Match the colocated lifecycle used by verl: keep the inference engine
+            # asleep while the training state owns the GPU. A trainside rollout has
+            # no sync role and shares the live training model, so it must stay awake.
+            if self.weight_sync is not None:
+                rollout_sleep_attempted = True
+                self.rollout.sleep()
+                rollout_memory_released = True
+                if bootstrap_offloaded:
+                    self.backend.onload()
+        except BaseException:
+            if bootstrap_offloaded and not rollout_boot_started:
+                self.backend.onload()
+            elif bootstrap_offloaded and rollout_constructed and not rollout_sleep_attempted:
+                try:
+                    self.rollout.sleep()
+                except BaseException:
+                    logger.exception("Failed to release rollout memory after bootstrap failure")
+                else:
+                    self.backend.onload()
+            elif bootstrap_offloaded and rollout_memory_released:
+                # The rollout is already safely asleep; preserve the original
+                # error (for example, a failed FSDP onload) without retrying it.
+                pass
+            raise
+
+    def _prepare_rollout(self, *, sync_weights: bool) -> bool:
+        """Wake/sync the rollout and optionally offload the train state.
+
+        Returns whether the train state was offloaded and must be restored by
+        :meth:`_finish_rollout`.
+        """
+        do_offload = self._enable_fsdp_offload and self.weight_sync is not None
+        do_sync = sync_weights and self.weight_sync is not None
+        train_state_maybe_offloaded = False
+        full_wake_after_train_offload_in_progress = False
+
+        try:
+            if do_sync and do_offload and self._supports_staged_wake:
+                # Keep the large KV and CUDA-graph regions paused during the full
+                # FSDP gather. A following full wake resumes only those remaining
+                # regions because SGLangRolloutEngine tracks the weights stage.
+                self.rollout.wake_up(tags=["weights"])
+                self.weight_sync.sync()
+                train_state_maybe_offloaded = True
+                self.backend.offload()
+                # If this call fails after SGLang resumed only some tags (or the
+                # response is lost), its two boolean lifecycle flags cannot
+                # prove which regions are live. Fail closed with FSDP left on
+                # CPU rather than risk a double-resident onload.
+                full_wake_after_train_offload_in_progress = True
+                self.rollout.wake_up()
+                full_wake_after_train_offload_in_progress = False
+            elif do_sync:
+                self.rollout.wake_up()
+                self.weight_sync.sync()
+                if do_offload:
+                    # Non-SGLang backends have no tagged wake, so their full
+                    # wake and sync must precede the training-state handoff.
+                    train_state_maybe_offloaded = True
+                    self.backend.offload()
+            elif do_offload:
+                # No sync needs the train model this round, so release it before
+                # restoring any SGLang/vLLM region.
+                train_state_maybe_offloaded = True
+                self.backend.offload()
+                full_wake_after_train_offload_in_progress = True
+                self.rollout.wake_up()
+                full_wake_after_train_offload_in_progress = False
             else:
-                self.rollout = remote(**rollout_parsed)  # for vllm / sglang
+                self.rollout.wake_up()
+        except BaseException:
+            # Recover when the ownership state is known. During a failed full
+            # wake after offload, keep the training state parked as above.
+            if full_wake_after_train_offload_in_progress:
+                raise
+            self._finish_rollout(train_state_offloaded=train_state_maybe_offloaded)
+            raise
 
-            self.reward = remote_hydra(reward_cfg)
-            self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
-            self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
+        return train_state_maybe_offloaded
 
-            if sync_cfg is not None:
-                self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
+    def _finish_rollout(self, *, train_state_offloaded: bool) -> None:
+        """Sleep SGLang before restoring the colocated training state."""
+        # If sleep fails, do not put the training state back on the same GPUs:
+        # the inference regions may still be live and an onload would turn the
+        # original lifecycle error into a process-killing OOM.
+        self.rollout.sleep()
+        if train_state_offloaded:
+            self.backend.onload()
 
     def _build_req(self, inputs: RolloutInputs, rollout_id: int) -> RolloutReq:
         """Turn a data source batch into a typed :class:`RolloutReq`.
@@ -149,11 +266,11 @@ class ARTrainer(BaseTrainer):
         ``rollout_id`` only keys the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
         """
         t0 = time.perf_counter()
-        self.rollout.wake_up()
-        if sync_weights and self.weight_sync is not None:
-            self.weight_sync.sync()
-        resp = self.rollout.generate(req)
-        self.rollout.sleep()
+        train_state_offloaded = self._prepare_rollout(sync_weights=sync_weights)
+        try:
+            resp = self.rollout.generate(req)
+        finally:
+            self._finish_rollout(train_state_offloaded=train_state_offloaded)
 
         for name, track in list(resp.tracks.items()):
             if track.segment is not None:
@@ -222,10 +339,8 @@ class ARTrainer(BaseTrainer):
         )
         reward_sum, reward_n, prompt_n, batch_n = 0.0, 0, 0, 0
 
-        self.rollout.wake_up()
+        train_state_offloaded = self._prepare_rollout(sync_weights=self.weight_sync is not None)
         try:
-            if self.weight_sync is not None:
-                self.weight_sync.sync()
             for eval_inputs in eval_batches:
                 batch_n += 1
                 prompt_n += len(eval_inputs.sample_ids)
@@ -248,7 +363,7 @@ class ARTrainer(BaseTrainer):
                         reward_n += int(rewards.numel())
                         break  # single-track for now; revisit if multi-track lands
         finally:
-            self.rollout.sleep()
+            self._finish_rollout(train_state_offloaded=train_state_offloaded)
 
         acc = reward_sum / max(1, reward_n)
         logger.info(
