@@ -45,6 +45,14 @@ class SGLangRolloutEngine(BaseRolloutEngine):
 
     _component_name = "sglang"
 
+    # Marks this role as accepting per-rank rollout-TP kwargs (tp_rank/tp_size/
+    # tp_visible_devices/pp_rank/ep_rank/ep_size) from Handle. Read by
+    # ``_is_sglang_rollout_role`` in group/handle.py to gate the kwargs
+    # injection — a string-name check would silently break on rename or
+    # subclassing, so an explicit opt-in flag is safer. Other roles (weight
+    # sync, reward, algorithms) do NOT set this and never receive these kwargs.
+    _accepts_rollout_tp_kwargs: bool = True
+
     def __init__(
         self,
         config: SGLangEngineConfig,
@@ -54,6 +62,16 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         rank: Optional[int] = None,
         model_config: Optional[Any] = None,
         ports: Optional[SGLangPorts] = None,
+        tp_rank: int = 0,
+        tp_size: int = 1,
+        tp_visible_devices: Optional[List[str]] = None,
+        # Compatibility for direct callers written against the first TP draft.
+        # Handle no longer supplies these cluster-global DevicePool ids.
+        tp_device_ids: Optional[List[int]] = None,
+        pp_rank: int = 0,
+        pp_size: int = 1,
+        ep_rank: int = 0,
+        ep_size: int = 1,
     ) -> None:
         require(
             isinstance(config, SGLangEngineConfig),
@@ -74,6 +92,52 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._is_offloaded = False
         self._weights_onloaded_for_sync = False
+
+        # Rollout tensor-parallel layout. Handle injects these per-rank when the
+        # rollout Handle carries tp/pp/ep > 1. tp_rank==0 boots a (possibly
+        # multi-GPU) SGLang engine spanning ``tp_visible_devices``; every other TP
+        # rank is a no-op shell that still occupies its Worker for training but
+        # holds no SGLang server (SGLang's own scheduler subprocesses own those
+        # GPUs). tp_size=1 (the default) reproduces the one-engine-per-GPU path.
+        self._tp_rank = int(tp_rank)
+        self._tp_size = int(tp_size)
+        self._pp_rank = int(pp_rank)
+        self._pp_size = int(pp_size)
+        # ep_rank/ep_size are recorded for completeness / future use: EP is
+        # sharded INSIDE SGLang (within the TP group), so UniRL never branches
+        # on them here. SGLang receives ep_size via server_intent → ServerArgs.
+        self._ep_rank = int(ep_rank)
+        self._ep_size = int(ep_size)
+        if tp_visible_devices is not None and tp_device_ids is not None:
+            raise ValueError("set only one of tp_visible_devices or tp_device_ids")
+        if tp_visible_devices is not None:
+            self._tp_visible_devices = [str(token) for token in tp_visible_devices]
+        elif tp_device_ids is not None:
+            # Direct, non-Handle callers historically passed node-local integer
+            # ids. Preserve that narrow API while preventing Handle from ever
+            # deriving them from cluster-global ids.
+            self._tp_visible_devices = [str(device_id) for device_id in tp_device_ids]
+        else:
+            self._tp_visible_devices = None
+        self._tp_device_ids = list(tp_device_ids) if tp_device_ids is not None else None
+        self._is_tp_zero = self._tp_rank == 0
+
+        if not self._is_tp_zero:
+            # No-op shell: no SGLang server, no ports, no weight sync. All
+            # rollout verbs early-return via the ``_is_tp_zero`` guard. The
+            # adapter is still built so any pure-Python helpers stay available,
+            # but nothing touches the GPU here.
+            self.adapter = None
+            self._backend = None
+            self._weight_sync = None
+            logger.info(
+                "SGLangRolloutEngine: tp_rank=%d/%d is a no-op shell (rank=%s); "
+                "SGLang server hosted by tp_rank=0 of this TP group",
+                self._tp_rank,
+                self._tp_size,
+                rank,
+            )
+            return
 
         engine_kwargs: Dict[str, Any] = dict(config.engine_kwargs or {})
 
@@ -96,11 +160,12 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         self.adapter = get_adapter(config.model_family)(config, model_config, tokenizer=tokenizer, processor=processor)
 
         logger.info(
-            "Initializing sglang engine (rank=%s, model_family=%s, model=%s, tp=%s)",
+            "Initializing sglang engine (rank=%s, model_family=%s, model=%s, tp=%s, tp_group=%s)",
             rank,
             config.model_family,
             config.pretrained_model_ckpt_path,
-            config.tp_size,
+            self._tp_size,
+            self._tp_visible_devices,
         )
 
         # Ports — engine-reserved on this node at the last moment before the
@@ -109,11 +174,27 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         if ports is None:
             ports = SGLangPorts.reserve()
 
+        # Rollout-TP runtime overrides. The backend applies the Worker's actual
+        # Ray CUDA tokens only at the scheduler spawn boundary and resets
+        # base_gpu_id to zero inside that restricted logical device list.
+        runtime_overrides: Dict[str, Any] = {}
+        if self._tp_size > 1:
+            runtime_overrides["tp_size"] = self._tp_size
+            runtime_overrides["gpu_id_step"] = 1
+
         # Backend (the seam) — booted from the config-spelled intent.
-        intent = config.server_intent(ports=ports, extra=self.adapter.boot_kwargs())
+        intent = config.server_intent(
+            ports=ports,
+            extra=self.adapter.boot_kwargs(),
+            runtime_overrides=runtime_overrides or None,
+        )
         concurrency = int(engine_kwargs.get("concurrency", config.concurrency))
         if config.backend == "native":
-            self._backend = NativeBackend.boot(intent, concurrency=concurrency)
+            self._backend = NativeBackend.boot(
+                intent,
+                concurrency=concurrency,
+                cuda_visible_devices=self._tp_visible_devices,
+            )
         else:
             # The address peers reach this server at (the bind host is usually
             # the 0.0.0.0 wildcard). Node-identity discovery, not runtime I/O —
@@ -133,6 +214,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
                 advertise_host=str(advertise_host),
                 concurrency=concurrency,
                 health_timeout_s=float(engine_kwargs.get("health_timeout_s", 300.0)),
+                cuda_visible_devices=self._tp_visible_devices,
             )
 
         # Weight sync — owns all sync/LoRA state, over the live seam.
@@ -147,7 +229,17 @@ class SGLangRolloutEngine(BaseRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run text generation against the engine and return a typed response."""
+        """Run text generation against the engine and return a typed response.
+
+        Only tp_rank==0 hosts a SGLang server; other TP ranks in the group are
+        no-op shells. The ``DP_SCATTER`` collect (``_collect_dp_merge``) keeps
+        only results from ranks where ``tp_rank==0 and
+        is_pipeline_last_stage and sp_rank==0``, so a shell's return value is
+        dropped by the collect (the ``return None`` below is defensive — the
+        collect filters on ``RankInfo``, not on ``None``).
+        """
+        if not self._is_tp_zero:
+            return None
         require(
             int(req.batch_size) > 0,
             "SGLangRolloutEngine.generate requires non-empty req (batch_size > 0)",
@@ -181,6 +273,8 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         offloaded (post-sync re-offload), it releases the weights that
         ``onload_weights`` restored — or no-ops if they never were.
         """
+        if not self._is_tp_zero:
+            return
         release_tags = None if tags is None or len(tags) == 0 else list(tags)
         if release_tags is None and self._is_offloaded:
             if not self._weights_onloaded_for_sync:
@@ -204,6 +298,8 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         resume — e.g. ``wake_up(tags=["weights"])`` to allow weight sync, then
         ``wake_up(tags=["kv_cache", "cuda_graph"])`` before generation.
         """
+        if not self._is_tp_zero:
+            return
         full_wake = tags is None or len(tags) == 0
         resume_tags = None if full_wake else list(tags)
         if resume_tags is None:
@@ -221,6 +317,8 @@ class SGLangRolloutEngine(BaseRolloutEngine):
     def onload_weights(self, *, track_prefix: str = "") -> None:
         """Resume only model weights so tensor/NCCL sync can update them."""
         del track_prefix
+        if not self._is_tp_zero:
+            return
         if not self._is_offloaded:
             return
         if self._weights_onloaded_for_sync:
@@ -233,11 +331,15 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         return self._is_offloaded
 
     def health_check(self) -> bool:
+        if not self._is_tp_zero:
+            return True
         if self._is_offloaded:
             return True
         return self._backend.ping()
 
     def shutdown(self) -> None:
+        if not self._is_tp_zero or self._backend is None:
+            return
         self._backend.shutdown()
 
     def __del__(self):
@@ -268,6 +370,8 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         the field lets the SRT server accept all incoming weights correctly.
         """
         del target_modules, track_prefix
+        if not self._is_tp_zero:
+            return
         self._weight_sync.update_weights_from_tensor(
             serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
@@ -286,6 +390,8 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         del track_prefix
+        if not self._is_tp_zero:
+            return
         self._weight_sync.init_weights_update_group(
             master_address=master_address,
             master_port=master_port,
@@ -312,6 +418,8 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         :meth:`update_weights_from_tensor` for rationale).
         """
         del target_modules, track_prefix
+        if not self._is_tp_zero:
+            return
         self._weight_sync.update_weights_from_distributed(
             names=names,
             dtypes=dtypes,
@@ -327,6 +435,8 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         del track_prefix
+        if not self._is_tp_zero:
+            return
         self._weight_sync.destroy_weights_update_group(group_name=group_name)
 
     def set_lora_from_tensors(
@@ -336,11 +446,15 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         *,
         peft_config: Optional[dict] = None,
     ) -> None:
+        if not self._is_tp_zero:
+            return
         self._weight_sync.set_lora_from_tensors(adapter_name, lora_tensors, peft_config=peft_config)
 
     @property
     def lora_dirty(self) -> bool:
         """True when LoRA is in use but the adapter must be (re)pushed before generate."""
+        if not self._is_tp_zero or self._weight_sync is None:
+            return False
         return self._weight_sync.lora_dirty
 
     # ``update_weights_from_ipc`` is deliberately NOT defined — the base raises
