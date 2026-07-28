@@ -5,6 +5,11 @@
 # See hpsv3_scorer.py lines 16-18 for details.
 #
 transformers>=4.55.2,<4.58
+# The upgrade_transformers_version branch imports `get_kbit_device_map` from
+# trl, which older trl (<0.17) does not export. The branch bumped transformers
+# but left requirements.txt pinning trl==0.8.6, so pin a trl new enough to
+# export that symbol yet compatible with transformers 4.55-4.57.
+trl>=0.19,<0.22
 git+https://github.com/MizzenAI/HPSv3.git@ad33a29d5896fe46ae74f9865444d6adbadbc750
 peft
 timm
@@ -14,3 +19,17 @@ fire
 matplotlib
 opencv-python-headless
 qwen-vl-utils
+# hpsv3.model.qwen2vl_trainer imports torch.utils.tensorboard.SummaryWriter,
+# which requires tensorboard at import time even for inference-only scoring.
+tensorboard
+# FlashAttention-2. HPSv3's create_model_and_processor (hpsv3/train.py, also on
+# the inference path) does `try: import flash_attn` and then loads Qwen2-VL with
+# attn_implementation="flash_attention_2" whenever the import succeeds and
+# disable_flash_attn2 is False (its default) — otherwise it silently falls back
+# to SDPA. So the *presence of this package* is what flips the backbone onto
+# flash attention; no code change is possible/needed. PyPI's flash-attn builds
+# from source (needs nvcc, minutes-to-fail), so pin a prebuilt wheel matching
+# this venv exactly: cp312 / torch2.12 / cu130 (Hopper sm_90). FA3 does NOT fit
+# here — its import name is flash_attn_interface and HPSv3 hardcodes the FA2
+# string, so an FA3 wheel would be ignored.
+https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.17/flash_attn-2.8.3%2Bcu130torch2.12-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
