@@ -103,26 +103,14 @@ rewards:
       # KV footprint. Raise only after confirming GPU headroom.
       max_batch_size: 4
 
-  # Video HPSv3: scores every frame with HPSv3 and averages the top 30%.
-  # Reproduces Flash-GRPO's `videohpsv3` reward for WAN2.1 T2V. Requires a
-  # video (video_b64 or video_path) on the request. **Disabled by default**
-  # like the other T2V rewards.
-  #
-  # Shares envs/hpsv3.txt with the image scorer above — identical deps
-  # (opencv-python-headless is already in there), so Ray reuses the same
-  # cached venv instead of building a second one.
-  #
-  # COST: one Qwen2-VL-7B forward *per frame*. An 81-frame clip at
-  # frame_stride=1 is 81 forwards; a 64-video rollout is ~5.2k forwards,
-  # which makes this reward the dominant cost in a training step. Raise
-  # frame_stride to cut it roughly linearly.
-  #
-  # TIMEOUT: the default server.score_timeout_s (120) is far too low here —
-  # a 64-clip bucket at frame_stride=1 is ~1.3k batched forwards in one
-  # score() call, i.e. several minutes. Set server.score_timeout_s: 1800
-  # before enabling this, or start at frame_stride: 8. On timeout the Ray
-  # task keeps running (see server._await_ref), so the GPU time is spent
-  # and then discarded — an under-set timeout wastes the whole batch.
+  # Video HPSv3: scores every frame with HPSv3 and averages the top 30%,
+  # reproducing Flash-GRPO's videohpsv3 reward for WAN2.1 T2V. Needs a video
+  # (video_b64 / video_path) on the request; disabled by default like the other
+  # T2V rewards. Shares envs/hpsv3.txt with the image scorer above, so Ray
+  # reuses one cached venv. Costs one Qwen2-VL-7B forward per frame (~5.2k per
+  # 64-clip rollout at frame_stride 1), so raise server.score_timeout_s well
+  # above its 120 s default before enabling — on timeout the Ray task keeps
+  # running and its GPU time is discarded.
   # - name: videohpsv3
   #   scorer: videohpsv3
   #   runtime_env: envs/hpsv3.txt
