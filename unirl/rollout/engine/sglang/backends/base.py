@@ -60,6 +60,38 @@ def _normalize_cuda_visible_devices(
     return tokens
 
 
+<<<<<<< HEAD
+=======
+@contextmanager
+def _scheduler_spawn_environment(
+    cuda_visible_devices: Optional[Sequence[str]],
+) -> Iterator[None]:
+    """Quarantine ``LD_LIBRARY_PATH`` / ``CUDA_VISIBLE_DEVICES`` to the SGLang spawn."""
+    saved_ld_library_path = os.environ.get("LD_LIBRARY_PATH")
+    saved_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    active_library_dirs = _preloaded_cuda_driver_dirs() + _python_cuda_library_dirs()
+    inherited_library_dirs = (saved_ld_library_path or "").split(os.pathsep)
+    child_library_dirs = list(dict.fromkeys(active_library_dirs + [path for path in inherited_library_dirs if path]))
+    if child_library_dirs:
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(child_library_dirs)
+    else:
+        os.environ.pop("LD_LIBRARY_PATH", None)
+    if cuda_visible_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(cuda_visible_devices)
+    try:
+        yield
+    finally:
+        if saved_ld_library_path is None:
+            os.environ.pop("LD_LIBRARY_PATH", None)
+        else:
+            os.environ["LD_LIBRARY_PATH"] = saved_ld_library_path
+        if saved_cuda_visible_devices is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = saved_cuda_visible_devices
+
+
+>>>>>>> e59e22e7 (style(weight-sync): collapse checkpoint-engine IPC docstrings to one line)
 class RawResult(Protocol):
     """Structural view of one parsed SRT ``/generate`` candidate — the wire fields this engine consumes."""
 
