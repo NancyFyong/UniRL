@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import threading
+import zlib
 from typing import Any, Dict, Optional
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.weight_sync.full.base import FullWeightSync
+from unirl.distributed.weight_sync.transfer.ckpt_engine_transfer import (
+    CkptEngineWeightSender,
+    CoordinatedWeightSyncError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,12 +58,29 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         rank = ri.rank if ri is not None else 0
         is_tp_zero = ri is None or ri.tp_rank == 0
 
-        tp_size = self._get_tp_size()
-        self._validate_topology(tp_size)
-        zmq_handles = self._build_zmq_handles(tp_size)
-        sender, local_uuid, tp_rank = self._prepare_local_sender(zmq_handles, tp_size)
+        preflight_error: Optional[BaseException] = None
+        tp_size = 1
+        local_uuid = ""
+        try:
+            tp_size = self._get_tp_size()
+            self._validate_topology(tp_size)
+            self._validate_rollout_capability()
+            local_uuid = self._get_current_gpu_uuid()
+        except BaseException as exc:
+            preflight_error = exc
+        self._sender_consensus(preflight_error, "preflight")
 
-        error: Optional[BaseException] = None
+        topology_error: Optional[BaseException] = None
+        zmq_handles: Dict[str, str] = {}
+        try:
+            zmq_handles = self._build_zmq_handles(tp_size, local_uuid)
+        except BaseException as exc:
+            topology_error = exc
+        self._sender_consensus(topology_error, "topology")
+
+        sender, tp_rank = self._prepare_local_sender(zmq_handles, tp_size, local_uuid)
+
+        operation_error: Optional[BaseException] = None
         try:
             if not is_tp_zero:
                 self._run_sender(sender)
@@ -76,9 +99,17 @@ class CkptEngineIPCWeightSync(FullWeightSync):
                 )
                 self._run_exchange(sender, zmq_handles)
                 logger.info("[CkptEngine-IPC] rank %s: full weight sync completed", rank)
+        except CoordinatedWeightSyncError as exc:
+            self._poison_rollout(exc)
+            raise
         except BaseException as exc:
-            error = exc
-        self._sender_consensus(error, "complete")
+            operation_error = exc
+
+        try:
+            self._sender_consensus(operation_error, "complete")
+        except BaseException as exc:
+            self._poison_rollout(exc)
+            raise
 
     def _validate_topology(self, tp_size: int) -> None:
         """Reject SGLang layouts that the checkpoint-engine route cannot map."""
@@ -103,11 +134,27 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         if any(key.startswith("speculative") for key in engine_kwargs):
             raise NotImplementedError("CkptEngineIPCWeightSync does not support SGLang speculative decoding workers")
 
-    def _prepare_local_sender(self, zmq_handles: Dict[str, str], tp_size: int):
+    def _validate_rollout_capability(self) -> None:
+        """Require the dedicated checkpoint-engine rollout contract."""
+        update = getattr(self._rollout, "update_weights_from_checkpoint_engine_ipc", None)
+        poison = getattr(self._rollout, "mark_checkpoint_engine_sync_failed", None)
+        if not callable(update) or not callable(poison):
+            raise TypeError("CkptEngineIPCWeightSync requires a checkpoint-engine-capable rollout engine")
+        ri = self.rank_info
+        if ri is None or ri.tp_rank == 0:
+            backend = getattr(self._rollout, "_backend", None)
+            if backend is None or not callable(getattr(backend, "update_from_ipc", None)):
+                raise TypeError("CkptEngineIPCWeightSync currently supports only the SGLang HTTP backend")
+
+    def _prepare_local_sender(
+        self,
+        zmq_handles: Dict[str, str],
+        tp_size: int,
+        local_uuid: str,
+    ):
         """Select this TP rank's colocated endpoint and allocate its sender."""
         ri = self.rank_info
         tp_rank = int(ri.tp_rank) if ri is not None else 0
-        local_uuid = self._get_current_gpu_uuid()
         local_path = zmq_handles.get(local_uuid)
         if local_path is None:
             raise RuntimeError(
@@ -115,12 +162,11 @@ class CkptEngineIPCWeightSync(FullWeightSync):
                 f"uuid={local_uuid!r}, tp_rank={tp_rank}, tp_size={tp_size}, "
                 f"available_uuids={sorted(zmq_handles)!r}"
             )
-        return self._prepare_sender({local_uuid: local_path}), local_uuid, tp_rank
+        return self._prepare_sender({local_uuid: local_path}), tp_rank
 
     def _run_exchange(self, sender, zmq_handles: Dict[str, str]) -> None:
-        """Run receiver and sender with the backend-required thread placement."""
+        """Run the HTTP receiver beside the main-thread sender."""
         recv_error: dict = {}
-        sender_error: dict = {}
 
         def _spawn_receiver() -> None:
             """Trigger the SGLang engine to connect its REP sockets."""
@@ -129,36 +175,14 @@ class CkptEngineIPCWeightSync(FullWeightSync):
                     zmq_handles=zmq_handles,
                     flush_cache=self._flush_cache,
                     track_prefix=self._track_prefix,
+                    timeout_s=self._timeout_s + 30,
                 )
             except Exception as exc:
                 recv_error["exc"] = exc
 
-        def _spawn_sender() -> None:
-            try:
-                self._run_sender(sender)
-            except Exception as exc:
-                sender_error["exc"] = exc
-
-        if self._receiver_must_run_on_main_thread():
-            self._run_native_exchange(_spawn_receiver, _spawn_sender)
-        else:
-            self._run_http_exchange(_spawn_receiver, sender)
-
+        self._run_http_exchange(_spawn_receiver, sender)
         if "exc" in recv_error:
             raise RuntimeError("CkptEngineIPCWeightSync: rollout receiver failed") from recv_error["exc"]
-        if "exc" in sender_error:
-            raise RuntimeError("CkptEngineIPCWeightSync: trainer sender failed") from sender_error["exc"]
-
-    def _run_native_exchange(self, receive, send) -> None:
-        """Run native receiver on the engine-owning thread."""
-        sender_thread = threading.Thread(target=send, daemon=True)
-        sender_thread.start()
-        try:
-            receive()
-        finally:
-            sender_thread.join(timeout=self._timeout_s + 30)
-        if sender_thread.is_alive():
-            raise TimeoutError("CkptEngineIPCWeightSync: sender thread did not stop")
 
     def _run_http_exchange(self, receive, sender) -> None:
         """Run the thread-safe HTTP receiver beside the main-thread sender."""
@@ -173,10 +197,6 @@ class CkptEngineIPCWeightSync(FullWeightSync):
 
     def _prepare_sender(self, zmq_handles: Dict[str, str]):
         """Allocate every rank's IPC buffer before starting any receiver."""
-        from unirl.distributed.weight_sync.transfer.ckpt_engine_transfer import (
-            CkptEngineWeightSender,
-        )
-
         sender = CkptEngineWeightSender(
             zmq_handles=zmq_handles,
             bucket_size_mb=self._bucket_bytes // (1024 * 1024),
@@ -189,25 +209,11 @@ class CkptEngineIPCWeightSync(FullWeightSync):
             prepare_error = exc
             sender.close()
 
-        import torch
-        import torch.distributed as dist
-
-        if dist.is_initialized() and dist.get_world_size() > 1:
-            status = torch.tensor(
-                0 if prepare_error is not None else 1,
-                dtype=torch.int32,
-                device=f"cuda:{torch.cuda.current_device()}",
-            )
-            dist.all_reduce(status, op=dist.ReduceOp.MIN)
-            all_prepared = bool(status.item())
-        else:
-            all_prepared = prepare_error is None
-
-        if not all_prepared:
-            if prepare_error is not None:
-                raise RuntimeError("CkptEngineIPCWeightSync: failed to prepare local IPC sender") from prepare_error
+        try:
+            self._sender_consensus(prepare_error, "prepare")
+        except BaseException:
             sender.close()
-            raise RuntimeError("CkptEngineIPCWeightSync: another train rank failed to prepare its IPC sender")
+            raise
         return sender
 
     def _run_sender(self, sender) -> None:
@@ -216,24 +222,31 @@ class CkptEngineIPCWeightSync(FullWeightSync):
 
     @staticmethod
     def _sender_consensus(error: Optional[BaseException], phase: str) -> None:
-        """Keep every train rank on the same transport/FSDP boundary."""
+        """Fail every train rank together and reject mismatched phases."""
         import torch
         import torch.distributed as dist
 
         if not dist.is_initialized() or dist.get_world_size() == 1:
             if error is not None:
-                raise error
+                raise CoordinatedWeightSyncError(f"CkptEngineIPCWeightSync failed during {phase}") from error
             return
-        status = torch.tensor(
-            0 if error is not None else 1,
-            dtype=torch.int32,
+
+        phase_id = zlib.crc32(phase.encode("utf-8"))
+        state = torch.tensor(
+            [phase_id, -phase_id, int(error is None)],
+            dtype=torch.int64,
             device=f"cuda:{torch.cuda.current_device()}",
         )
-        dist.all_reduce(status, op=dist.ReduceOp.MIN)
-        if error is not None:
-            raise error
-        if not bool(status.item()):
-            raise RuntimeError(f"CkptEngineIPCWeightSync: a peer sender failed during {phase}")
+        dist.all_reduce(state, op=dist.ReduceOp.MIN)
+        min_phase, neg_max_phase, all_succeeded = (int(value) for value in state.cpu().tolist())
+
+        if min_phase != -neg_max_phase:
+            raise CoordinatedWeightSyncError(
+                "CkptEngineIPCWeightSync ranks reached different protocol phases; "
+                f"local_phase={phase!r}, observed_phase_id_range=({min_phase}, {-neg_max_phase})"
+            ) from error
+        if not all_succeeded:
+            raise CoordinatedWeightSyncError(f"CkptEngineIPCWeightSync failed during {phase}") from error
 
     def _get_tp_size(self) -> int:
         """Get the SGLang engine's TP size."""
@@ -248,20 +261,27 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         uuid = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
         return uuid if uuid.startswith("GPU-") else f"GPU-{uuid}"
 
-    def _build_zmq_handles(self, tp_size: int) -> Dict[str, str]:
+    @staticmethod
+    def _new_zmq_endpoint() -> str:
+        """Return a process- and update-unique Linux abstract IPC endpoint."""
+        return f"ipc://@unirl-ce-{os.getpid()}-{secrets.token_hex(6)}"
+
+    def _build_zmq_handles(self, tp_size: int, local_uuid: str) -> Dict[str, str]:
         """Build ``{device_uuid: zmq_socket_path}`` for this TP group."""
         import socket
 
         import torch.distributed as dist
 
         ri = self.rank_info
+        local_endpoint = self._new_zmq_endpoint()
         if ri is not None and dist.is_initialized() and dist.get_world_size() > 1:
             local = {
                 "dp_rank": int(ri.dp_rank),
                 "pp_rank": int(ri.pp_rank),
                 "tp_rank": int(ri.tp_rank),
                 "host": socket.gethostname(),
-                "uuid": self._get_current_gpu_uuid(),
+                "uuid": local_uuid,
+                "endpoint": local_endpoint,
             }
             gathered = [None] * dist.get_world_size()
             dist.all_gather_object(gathered, local)
@@ -272,6 +292,10 @@ class CkptEngineIPCWeightSync(FullWeightSync):
                 items.sort(key=lambda item: item["tp_rank"])
                 if len(items) != tp_size or [item["tp_rank"] for item in items] != list(range(tp_size)):
                     raise RuntimeError(f"CkptEngineIPCWeightSync: incomplete TP group metadata for {key}: {items}")
+                if len({item["uuid"] for item in items}) != tp_size:
+                    raise RuntimeError(f"CkptEngineIPCWeightSync: duplicate GPU UUIDs in TP group {key}: {items}")
+                if len({item["endpoint"] for item in items}) != tp_size:
+                    raise RuntimeError(f"CkptEngineIPCWeightSync: duplicate IPC endpoints in TP group {key}: {items}")
                 hosts = {item["host"] for item in items}
                 if len(hosts) != 1:
                     raise NotImplementedError(
@@ -279,23 +303,18 @@ class CkptEngineIPCWeightSync(FullWeightSync):
                         f"group={key}, hosts={sorted(hosts)}"
                     )
             group = groups[(local["dp_rank"], local["pp_rank"])]
-            job_id = os.environ.get("RAY_JOB_ID", "default")
-            return {item["uuid"]: f"ipc:///tmp/unirl-ckpt-engine-{job_id}-{item['uuid']}.sock" for item in group}
+            return {item["uuid"]: item["endpoint"] for item in group}
 
         if tp_size != 1:
             raise RuntimeError("CkptEngineIPCWeightSync requires an initialized distributed group when tp_size>1")
-        uuid = self._get_current_gpu_uuid()
-        job_id = os.environ.get("RAY_JOB_ID", "default")
-        return {uuid: f"ipc:///tmp/unirl-ckpt-engine-{job_id}-{uuid}.sock"}
+        return {local_uuid: local_endpoint}
 
-    def _receiver_must_run_on_main_thread(self) -> bool:
-        """Whether IPC receive must run on the rollout engine's owning thread."""
-        backend = getattr(self._rollout, "_backend", None)
-        if backend is None or not hasattr(backend, "requires_main_thread_ipc_receiver"):
-            raise RuntimeError(
-                "CkptEngineIPCWeightSync requires a rollout backend that declares requires_main_thread_ipc_receiver"
-            )
-        return bool(backend.requires_main_thread_ipc_receiver)
+    def _poison_rollout(self, error: BaseException) -> None:
+        """Prevent generation after a possibly partial live-weight update."""
+        try:
+            self._rollout.mark_checkpoint_engine_sync_failed(str(error))
+        except Exception:
+            logger.exception("Failed to mark rollout unhealthy after checkpoint-engine sync failure")
 
 
 __all__ = ["CkptEngineIPCWeightSync"]

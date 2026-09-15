@@ -149,8 +149,6 @@ class LoopThread:
 class NativeBackend:
     """The native ``Backend`` impl over an in-process ``sglang.Engine``."""
 
-    requires_main_thread_ipc_receiver = True
-
     def __init__(
         self,
         engine: Any,
@@ -458,20 +456,6 @@ class NativeBackend:
         self._require_alive("destroy_weights_group")
         result = self._lt.run_parked(lambda: self._engine.destroy_weights_update_group(group_name=str(group_name)))
         self._check_result(result, "destroy_weights_group")
-
-    def update_from_ipc(
-        self,
-        *,
-        zmq_handles: Dict[str, str],
-        flush_cache: bool = True,
-    ) -> None:
-        """Update weights via SGLang ``update_weights_from_ipc`` (ZMQ + CUDA IPC)."""
-        self._require_alive("update_from_ipc")
-        result = self._engine.update_weights_from_ipc(
-            zmq_handles=zmq_handles,
-            flush_cache=flush_cache,
-        )
-        self._check_result(result, "update_from_ipc")
 
     def set_lora(
         self,

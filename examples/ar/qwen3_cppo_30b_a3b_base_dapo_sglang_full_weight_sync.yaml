@@ -5,8 +5,8 @@
 #
 # It keeps every non-LoRA training / sampling / optimization setting aligned
 # with the LoRA recipe.  The only functional changes are: train full model
-# weights instead of a LoRA adapter, and use checkpoint-engine IPC to push the
-# full bf16 model state into the colocated SGLang server every rollout.
+# weights instead of a LoRA adapter, and use TensorWeightSync to push the full
+# bf16 model state into the colocated SGLang server every rollout.
 #
 # Run:
 #   VENV_DIR=/path/to/venv \
@@ -141,13 +141,12 @@ algorithm:
     _target_: hydra.utils.get_class
     path: unirl.models.qwen3.conditions.Qwen3ARConditions
 
-# Per-GPU checkpoint-engine IPC avoids concentrating flatten/deserialization
-# copies on the TP-zero GPU. Qwen3-30B's bf16 embedding is about 594 MiB, and
-# checkpoint-engine cannot split one tensor across buckets, so use 640 MiB.
+# Full-weight tensor sync.  Each FSDP shard is gathered at bf16 and serialized
+# as tensor buckets for the colocated SGLang TP workers.
 sync:
-  _target_: unirl.distributed.weight_sync.full.ckpt_engine_ipc.CkptEngineIPCWeightSync
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
   lora_merged: false
-  bucket_size_mb: 640
+  bucket_size_mb: 512
   wire_dtype: bf16
   flush_cache: true
 

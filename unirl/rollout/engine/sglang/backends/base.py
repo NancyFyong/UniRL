@@ -70,13 +70,21 @@ class RawResult(Protocol):
 
 
 @runtime_checkable
+class CheckpointEngineIPCBackend(Protocol):
+    """Optional SGLang backend capability for checkpoint-engine IPC."""
+
+    def update_from_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool = True,
+        timeout_s: Optional[float] = None,
+    ) -> None: ...
+
+
+@runtime_checkable
 class Backend(Protocol):
     """The seam every ``sglang`` collaborator reaches the runtime through."""
-
-    # ``NativeBackend.update_from_ipc`` drives the engine event loop and must
-    # run on the engine-owning thread. HTTP transport is thread-safe. Weight
-    # sync uses this capability instead of coupling to concrete class names.
-    requires_main_thread_ipc_receiver: bool
 
     def generate(self, requests: List[Dict[str, Any]]) -> List[RawResult]: ...
     def abort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None: ...
@@ -122,12 +130,5 @@ class Backend(Protocol):
         config_dict: Optional[dict] = None,
     ) -> None: ...
 
-    def update_from_ipc(
-        self,
-        *,
-        zmq_handles: Dict[str, str],
-        flush_cache: bool = True,
-    ) -> None: ...
 
-
-__all__ = ["Backend", "RawResult"]
+__all__ = ["Backend", "CheckpointEngineIPCBackend", "RawResult"]

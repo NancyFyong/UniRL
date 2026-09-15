@@ -207,8 +207,6 @@ def parse_generate_response(response: Any) -> List[_HTTPRawResult]:
 class HTTPBackend:
     """The HTTP ``Backend`` impl over a spawned SGLang SRT server."""
 
-    requires_main_thread_ipc_receiver = False
-
     def __init__(
         self,
         server_process: multiprocessing.Process,
@@ -399,9 +397,16 @@ class HTTPBackend:
                 pass
             raise RuntimeError(f"SGLang SRT HTTP {exc.code} for {url}: {error_body}") from exc
 
-    def _post_struct(self, path: str, req: Any, operation: str) -> None:
+    def _post_struct(
+        self,
+        path: str,
+        req: Any,
+        operation: str,
+        *,
+        timeout: Any = _TIERED_TIMEOUT,
+    ) -> None:
         """POST a typed io_struct request (its non-``None`` fields) and check."""
-        resp = self._post(path, asdict_drop_none(req))
+        resp = self._post(path, asdict_drop_none(req), timeout=timeout)
         self._check_update_response(resp, operation)
 
     @staticmethod
@@ -553,6 +558,7 @@ class HTTPBackend:
         *,
         zmq_handles: Dict[str, str],
         flush_cache: bool = True,
+        timeout_s: Optional[float] = None,
     ) -> None:
         self._post_struct(
             "/update_weights_from_ipc",
@@ -561,6 +567,7 @@ class HTTPBackend:
                 flush_cache=flush_cache,
             ),
             "update_from_ipc",
+            timeout=_TIERED_TIMEOUT if timeout_s is None else float(timeout_s),
         )
 
     def set_lora(
