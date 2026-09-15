@@ -44,7 +44,6 @@ def _import_sglang_engine() -> Dict[str, Any]:
     from sglang.srt.entrypoints.engine import Engine
     from sglang.srt.managers.io_struct import (
         LoadLoRAAdapterFromTensorsReqInput,
-        UpdateWeightsFromIPCReqInput,
         UpdateWeightsFromTensorReqInput,
     )
     from sglang.srt.server_args import ServerArgs
@@ -55,7 +54,6 @@ def _import_sglang_engine() -> Dict[str, Any]:
         "ServerArgs": ServerArgs,
         "MultiprocessingSerializer": MultiprocessingSerializer,
         "UpdateWeightsFromTensorReqInput": UpdateWeightsFromTensorReqInput,
-        "UpdateWeightsFromIPCReqInput": UpdateWeightsFromIPCReqInput,
         "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput,
     }
 

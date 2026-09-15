@@ -79,7 +79,6 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         except BaseException as exc:
             error = exc
         self._sender_consensus(error, "complete")
-        self.weight_version += 1
 
     def _validate_topology(self, tp_size: int) -> None:
         """Reject SGLang layouts that the checkpoint-engine route cannot map."""
@@ -111,12 +110,11 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         local_uuid = self._get_current_gpu_uuid()
         local_path = zmq_handles.get(local_uuid)
         if local_path is None:
-            try:
-                local_uuid, local_path = list(zmq_handles.items())[tp_rank]
-            except IndexError as exc:
-                raise RuntimeError(
-                    f"CkptEngineIPCWeightSync: tp_rank={tp_rank} has no IPC handle in a tp_size={tp_size} rollout group"
-                ) from exc
+            raise RuntimeError(
+                "CkptEngineIPCWeightSync: the current GPU has no matching IPC endpoint; "
+                f"uuid={local_uuid!r}, tp_rank={tp_rank}, tp_size={tp_size}, "
+                f"available_uuids={sorted(zmq_handles)!r}"
+            )
         return self._prepare_sender({local_uuid: local_path}), local_uuid, tp_rank
 
     def _run_exchange(self, sender, zmq_handles: Dict[str, str]) -> None:
@@ -127,7 +125,7 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         def _spawn_receiver() -> None:
             """Trigger the SGLang engine to connect its REP sockets."""
             try:
-                self._rollout.update_weights_from_ipc(
+                self._rollout.update_weights_from_checkpoint_engine_ipc(
                     zmq_handles=zmq_handles,
                     flush_cache=self._flush_cache,
                     track_prefix=self._track_prefix,
@@ -293,7 +291,11 @@ class CkptEngineIPCWeightSync(FullWeightSync):
     def _receiver_must_run_on_main_thread(self) -> bool:
         """Whether IPC receive must run on the rollout engine's owning thread."""
         backend = getattr(self._rollout, "_backend", None)
-        return bool(getattr(backend, "requires_main_thread_ipc_receiver", False))
+        if backend is None or not hasattr(backend, "requires_main_thread_ipc_receiver"):
+            raise RuntimeError(
+                "CkptEngineIPCWeightSync requires a rollout backend that declares requires_main_thread_ipc_receiver"
+            )
+        return bool(backend.requires_main_thread_ipc_receiver)
 
 
 __all__ = ["CkptEngineIPCWeightSync"]
