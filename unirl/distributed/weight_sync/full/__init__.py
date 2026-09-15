@@ -1,4 +1,4 @@
-"""Full base-weight sync handlers referenced from configs via ``_target_``."""
+"""Full base-weight sync handlers for the v2 trainer."""
 
 from unirl.distributed.weight_sync.full.base import FullWeightSync
 from unirl.distributed.weight_sync.full.ckpt_engine_ipc import CkptEngineIPCWeightSync
