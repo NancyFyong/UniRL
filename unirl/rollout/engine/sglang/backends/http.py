@@ -151,7 +151,16 @@ def _launch_server_with_env(server_args: Any, env_overrides: Dict[str, str]) -> 
 
 def asdict_drop_none(req: Any) -> Dict[str, Any]:
     """The wire view of an io_struct request: its fields minus the ``None``s."""
-    return {k: v for k, v in dataclasses.asdict(req).items() if v is not None}
+    if dataclasses.is_dataclass(req) and not isinstance(req, type):
+        items = dataclasses.asdict(req).items()
+    elif hasattr(req, "__struct_fields__"):
+        # SGLang >=0.5.12 moved io_struct payloads from dataclasses to msgspec.Struct.
+        items = ((name, getattr(req, name)) for name in req.__struct_fields__)
+    elif isinstance(req, dict):
+        items = req.items()
+    else:
+        raise TypeError(f"asdict_drop_none expected dataclass, msgspec.Struct, or dict; got {type(req)!r}")
+    return {k: v for k, v in items if v is not None}
 
 
 @dataclass(frozen=True)
@@ -268,7 +277,6 @@ class HTTPBackend:
         )
 
         multiprocessing.set_start_method("spawn", force=True)
-        server_args = rt["ServerArgs"](**server_kwargs)
 
         tp_size = int(server_kwargs.get("tp_size", 1))
         visible_devices = _normalize_cuda_visible_devices(
@@ -277,8 +285,12 @@ class HTTPBackend:
         )
         env_overrides: Dict[str, str] = {}
         if visible_devices is not None:
-            server_args.base_gpu_id = 0
+            # SGLang >=0.5.12 freezes ServerArgs after construction; pass via kwargs.
+            if "base_gpu_id" in allowed:
+                server_kwargs["base_gpu_id"] = 0
             env_overrides["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices)
+
+        server_args = rt["ServerArgs"](**server_kwargs)
         process = multiprocessing.Process(
             target=_launch_server_with_env,
             args=(server_args, env_overrides),
