@@ -140,10 +140,14 @@ class CkptEngineIPCWeightSync(FullWeightSync):
 
     def _validate_rollout_capability(self) -> None:
         """Require the dedicated checkpoint-engine rollout contract."""
-        update = getattr(self._rollout, "update_weights_from_checkpoint_engine_ipc", None)
-        poison = getattr(self._rollout, "mark_checkpoint_engine_sync_failed", None)
-        if not callable(update) or not callable(poison):
-            raise TypeError("CkptEngineIPCWeightSync requires a checkpoint-engine-capable rollout engine")
+        required = (
+            "update_weights_from_checkpoint_engine_ipc",
+            "mark_checkpoint_engine_sync_failed",
+            "shutdown",
+        )
+        missing = [name for name in required if not callable(getattr(self._rollout, name, None))]
+        if missing:
+            raise TypeError(f"CkptEngineIPCWeightSync rollout is missing required capabilities: {missing}")
         ri = self.rank_info
         if ri is None or ri.tp_rank == 0:
             backend = getattr(self._rollout, "_backend", None)

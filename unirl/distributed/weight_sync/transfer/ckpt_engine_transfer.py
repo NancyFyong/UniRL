@@ -196,26 +196,11 @@ class CkptEngineWeightSender:
         if not dist.is_initialized() or dist.get_world_size() == 1:
             return
 
-        failures: list[Exception] = []
         world = dist.group.WORLD
-        try:
-            abort = getattr(world, "abort", None)
-            if not callable(abort):
-                raise RuntimeError("default ProcessGroup has no abort() capability")
-            abort()
-            return
-        except Exception as exc:
-            failures.append(exc)
-            logger.exception("ProcessGroup.abort() failed; falling back to destroy_process_group()")
-
-        try:
-            dist.destroy_process_group(world)
-        except Exception as exc:
-            failures.append(exc)
-            raise RuntimeError("failed to abort or destroy the default process group") from ExceptionGroup(
-                "process-group shutdown failures",
-                failures,
-            )
+        abort = getattr(world, "abort", None)
+        if not callable(abort):
+            raise RuntimeError("default ProcessGroup has no abort() capability")
+        abort()
 
     @staticmethod
     def _exchange(
