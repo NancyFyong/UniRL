@@ -296,6 +296,10 @@ class HTTPBackend:
             tp_size=tp_size,
         )
         env_overrides: Dict[str, str] = {}
+        # Keep driver PYTHONPATH (venv site-packages) visible to the SRT child.
+        pythonpath = os.environ.get("PYTHONPATH")
+        if pythonpath:
+            env_overrides["PYTHONPATH"] = pythonpath
         if visible_devices is not None:
             # SGLang >=0.5.12 freezes ServerArgs after construction; pass via kwargs.
             if "base_gpu_id" in allowed:
