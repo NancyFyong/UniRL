@@ -15,8 +15,9 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 from unirl.rollout.engine.sglang.backends.base import (
     _filter_server_args_or_raise,
@@ -122,6 +123,15 @@ def _import_sglang_runtime() -> Dict[str, Any]:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.utils import MultiprocessingSerializer
 
+    try:
+        from sglang.srt.managers.io_struct import (
+            BeginWeightUpdateReqInput,
+            EndWeightUpdateReqInput,
+        )
+    except ImportError:  # older SGLang without sessioned weight updates
+        BeginWeightUpdateReqInput = None
+        EndWeightUpdateReqInput = None
+
     return {
         "launch_server": launch_server,
         "ServerArgs": ServerArgs,
@@ -134,6 +144,8 @@ def _import_sglang_runtime() -> Dict[str, Any]:
         "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput,
         "ReleaseMemoryOccupationReqInput": ReleaseMemoryOccupationReqInput,
         "ResumeMemoryOccupationReqInput": ResumeMemoryOccupationReqInput,
+        "BeginWeightUpdateReqInput": BeginWeightUpdateReqInput,
+        "EndWeightUpdateReqInput": EndWeightUpdateReqInput,
     }
 
 
@@ -483,6 +495,28 @@ class HTTPBackend:
             logger.info("Shutting down SGLang SRT server (pid=%s)", process.pid)
             _terminate_server_process(process)
 
+    @contextmanager
+    def _weight_update_session(self) -> Iterator[None]:
+        """Open SGLang's begin/end weight-update session when the runtime has it."""
+        begin_cls = self._rt.get("BeginWeightUpdateReqInput")
+        end_cls = self._rt.get("EndWeightUpdateReqInput")
+        if begin_cls is None or end_cls is None:
+            yield
+            return
+        self._post_struct(
+            "/begin_weight_update",
+            begin_cls(),
+            "begin_weight_update",
+        )
+        try:
+            yield
+        finally:
+            self._post_struct(
+                "/end_weight_update",
+                end_cls(),
+                "end_weight_update",
+            )
+
     def update_from_tensor(
         self,
         *,
@@ -490,15 +524,16 @@ class HTTPBackend:
         load_format: Optional[str],
         flush_cache: bool,
     ) -> None:
-        self._post_struct(
-            "/update_weights_from_tensor",
-            self._rt["UpdateWeightsFromTensorReqInput"](
-                serialized_named_tensors=serialized_named_tensors,
-                load_format=load_format,
-                flush_cache=flush_cache,
-            ),
-            "update_from_tensor",
-        )
+        with self._weight_update_session():
+            self._post_struct(
+                "/update_weights_from_tensor",
+                self._rt["UpdateWeightsFromTensorReqInput"](
+                    serialized_named_tensors=serialized_named_tensors,
+                    load_format=load_format,
+                    flush_cache=flush_cache,
+                ),
+                "update_from_tensor",
+            )
 
     def init_weights_group(
         self,
@@ -546,17 +581,18 @@ class HTTPBackend:
             names[-1] if names else "<empty>",
             flush_cache,
         )
-        self._post_struct(
-            "/update_weights_from_distributed",
-            self._rt["UpdateWeightsFromDistributedReqInput"](
-                names=list(names),
-                dtypes=list(dtypes),
-                shapes=[list(s) for s in shapes],
-                group_name=str(group_name),
-                flush_cache=flush_cache,
-            ),
-            "update_from_distributed",
-        )
+        with self._weight_update_session():
+            self._post_struct(
+                "/update_weights_from_distributed",
+                self._rt["UpdateWeightsFromDistributedReqInput"](
+                    names=list(names),
+                    dtypes=list(dtypes),
+                    shapes=[list(s) for s in shapes],
+                    group_name=str(group_name),
+                    flush_cache=flush_cache,
+                ),
+                "update_from_distributed",
+            )
 
     def destroy_weights_group(self, *, group_name: str) -> None:
         self._post_struct(

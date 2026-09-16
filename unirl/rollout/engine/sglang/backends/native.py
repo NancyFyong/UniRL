@@ -389,9 +389,20 @@ class NativeBackend:
             flush_cache=flush_cache,
         )
         engine = self._engine
-        result = self._lt.run_parked(
-            lambda: engine.loop.run_until_complete(engine.tokenizer_manager.update_weights_from_tensor(obj, None))
-        )
+        begin = getattr(engine, "begin_weight_update", None)
+        end = getattr(engine, "end_weight_update", None)
+
+        def _update() -> Any:
+            return engine.loop.run_until_complete(engine.tokenizer_manager.update_weights_from_tensor(obj, None))
+
+        if callable(begin) and callable(end):
+            self._lt.run_parked(lambda: begin())
+            try:
+                result = self._lt.run_parked(_update)
+            finally:
+                self._lt.run_parked(lambda: end())
+        else:
+            result = self._lt.run_parked(_update)
         self._check_result(result, "update_from_tensor")
 
     def init_weights_group(
@@ -441,15 +452,27 @@ class NativeBackend:
             flush_cache,
         )
         self._require_alive("update_from_distributed")
-        result = self._lt.run_parked(
-            lambda: self._engine.update_weights_from_distributed(
+        engine = self._engine
+        begin = getattr(engine, "begin_weight_update", None)
+        end = getattr(engine, "end_weight_update", None)
+
+        def _update() -> Any:
+            return engine.update_weights_from_distributed(
                 names=list(names),
                 dtypes=list(dtypes),
                 shapes=[list(s) for s in shapes],
                 group_name=str(group_name),
                 flush_cache=flush_cache,
             )
-        )
+
+        if callable(begin) and callable(end):
+            self._lt.run_parked(lambda: begin())
+            try:
+                result = self._lt.run_parked(_update)
+            finally:
+                self._lt.run_parked(lambda: end())
+        else:
+            result = self._lt.run_parked(_update)
         self._check_result(result, "update_from_distributed")
 
     def destroy_weights_group(self, *, group_name: str) -> None:
