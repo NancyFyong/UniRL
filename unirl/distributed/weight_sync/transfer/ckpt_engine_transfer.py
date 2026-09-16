@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import gc
 import logging
-import os
 import time
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -25,13 +24,13 @@ class CkptEngineWeightSender:
 
     def __init__(
         self,
-        zmq_handles: Dict[str, str],
+        socket_path: str,
         bucket_size_mb: int,
         timeout_s: int,
     ) -> None:
-        if not zmq_handles:
-            raise ValueError("zmq_handles must be non-empty")
-        self.socket_paths = list(zmq_handles.values())
+        if not socket_path:
+            raise ValueError("socket_path must be non-empty")
+        self.socket_path = socket_path
         self.bucket_size_mb = int(bucket_size_mb)
         self.bucket_size = self.bucket_size_mb << 20
         self.timeout_ms = int(timeout_s) * 1000
@@ -41,8 +40,8 @@ class CkptEngineWeightSender:
             raise ValueError(f"timeout_s must be positive; got {timeout_s}")
 
         self.zmq_context = zmq.Context.instance()
-        self.sockets: List[zmq.Socket] = []
-        self._can_send: List[bool] = []
+        self.socket: Optional[zmq.Socket] = None
+        self._can_send = False
         self.buffer = None
         self._handle = None
         self._abort_sent = False
@@ -50,23 +49,25 @@ class CkptEngineWeightSender:
 
     def prepare(self) -> None:
         """Allocate the CUDA IPC buffer; sockets are created later on the sender thread."""
+        if self.buffer is not None or self._handle is not None:
+            raise RuntimeError("CkptEngineWeightSender.prepare() may only be called once")
         self._allocate_buffer()
 
     def send_weights(
         self,
         weights: Iterator[Tuple[str, "object"]],
-        consensus: Callable[[Optional[BaseException], str], None] | None = None,
+        consensus: Callable[[Optional[BaseException], str], None],
     ) -> None:
         """Send ``(name, tensor)`` pairs to every supplied receiver."""
-        weight = None
         try:
             self._deadline = time.monotonic() + self.timeout_ms / 1000
-            if self.buffer is None:
-                self.prepare()
+            if self.buffer is None or self._handle is None:
+                raise RuntimeError("CkptEngineWeightSender.prepare() must succeed before send_weights()")
             # Create/bind sockets in THIS thread (see ``prepare`` docstring):
             # pyzmq sockets must live and die on the thread that uses them.
-            if not self.sockets:
-                self._init_sockets()
+            if self.socket is not None:
+                raise RuntimeError("CkptEngineWeightSender.send_weights() may only be called once")
+            self._init_socket()
             self._exchange(self._handshake, consensus, "handshake")
 
             offset = 0
@@ -108,7 +109,7 @@ class CkptEngineWeightSender:
 
                         # Flush current bucket if this tensor doesn't fit.
                         if aligned_offset + weight_nbytes > self.bucket_size and bucket_meta:
-                            torch.cuda.synchronize()
+                            torch.cuda.current_stream().synchronize()
                             self._exchange(
                                 lambda: self._send_bucket(bucket_meta),
                                 consensus,
@@ -136,7 +137,7 @@ class CkptEngineWeightSender:
                             }
                         )
                         payload = weight.detach().contiguous().view(-1).view(torch.uint8)
-                        self.buffer[aligned_offset : aligned_offset + weight_nbytes].copy_(payload, non_blocking=True)
+                        self.buffer[aligned_offset : aligned_offset + weight_nbytes].copy_(payload)
                         offset = aligned_offset + weight_nbytes
                 except CoordinatedWeightSyncError:
                     raise
@@ -146,14 +147,10 @@ class CkptEngineWeightSender:
                 # No rank may advance to the next DTensor/FSDP materialization
                 # until every rank has staged this tensor or observed exhaustion.
                 phase = f"tensor-{tensor_index}-done" if exhausted else f"tensor-{tensor_index}-staged"
-                if consensus is not None:
-                    consensus(stage_error, phase)
+                consensus(stage_error, phase)
                 if stage_error is not None:
                     raise stage_error
                 if exhausted:
-                    item = None
-                    weight = None
-                    payload = None
                     break
 
                 item = None
@@ -163,7 +160,7 @@ class CkptEngineWeightSender:
 
             # Send the last bucket
             if bucket_meta:
-                torch.cuda.synchronize()
+                torch.cuda.current_stream().synchronize()
                 self._exchange(
                     lambda: self._send_bucket(bucket_meta),
                     consensus,
@@ -172,13 +169,12 @@ class CkptEngineWeightSender:
 
             # Match checkpoint-engine's lifecycle: release both sides of the IPC
             # allocation before running a potentially memory-heavy post-hook.
-            self._exchange(self._send_none_to_all, consensus, "release")
-            weight = None
+            self._exchange(self._send_none, consensus, "release")
             self._release_buffer()
-            self._exchange(self._send_none_to_all, consensus, "post-hook")
+            self._exchange(self._send_none, consensus, "post-hook")
 
         except BaseException as exc:
-            self._abort_receivers(exc)
+            self._abort_receiver(exc)
             raise
         finally:
             close = getattr(weights, "close", None)
@@ -224,7 +220,7 @@ class CkptEngineWeightSender:
     @staticmethod
     def _exchange(
         operation: Callable[[], None],
-        consensus: Callable[[Optional[BaseException], str], None] | None,
+        consensus: Callable[[Optional[BaseException], str], None],
         phase: str,
     ) -> None:
         error = None
@@ -232,27 +228,29 @@ class CkptEngineWeightSender:
             operation()
         except BaseException as exc:
             error = exc
-        if consensus is not None:
-            consensus(error, phase)
+        consensus(error, phase)
         if error is not None:
             raise error
 
-    def _init_sockets(self) -> None:
-        """Create one REQ socket per supplied device handle."""
-        for path in self.socket_paths:
-            if path.startswith("ipc:///"):
-                ipc_path = path[len("ipc://") :]
-                try:
-                    os.remove(ipc_path)
-                except OSError:
-                    pass
-            sock = self.zmq_context.socket(zmq.REQ)
+    def _init_socket(self) -> None:
+        """Bind this rank's REQ socket."""
+        sock = self.zmq_context.socket(zmq.REQ)
+        try:
             sock.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
             sock.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
             sock.setsockopt(zmq.LINGER, 0)
-            sock.bind(path)
-            self.sockets.append(sock)
-            self._can_send.append(True)
+            sock.bind(self.socket_path)
+        except BaseException:
+            sock.close(linger=0)
+            raise
+        self.socket = sock
+        self._can_send = True
+
+    def _require_socket(self) -> zmq.Socket:
+        """Return the bound sender socket."""
+        if self.socket is None:
+            raise RuntimeError("checkpoint-engine sender socket is not initialized")
+        return self.socket
 
     def _allocate_buffer(self) -> None:
         """Allocate and export the reusable CUDA buffer."""
@@ -267,114 +265,90 @@ class CkptEngineWeightSender:
 
     def _handshake(self) -> None:
         """Send the prepared IPC handle to every receiver."""
-        # Send the IPC handle to every supplied receiver, then collect acks.
-        for i, sock in enumerate(self.sockets):
-            self._apply_remaining_timeout(sock)
-            sock.send_pyobj(self._handle)
-            self._can_send[i] = False
-        errors = []
-        for i, sock in enumerate(self.sockets):
-            self._apply_remaining_timeout(sock)
-            ack = sock.recv()
-            self._can_send[i] = True
-            if ack != b"":
-                errors.append(ack.decode("utf-8", errors="replace"))
-                # The worker's handshake error path waits for one raw ACK before
-                # raising and closing; it has not entered the payload state machine.
-                sock.send(b"")
-                self._can_send[i] = False
-        if errors:
-            raise RuntimeError(f"CkptEngineWeightSender: receiver handshake failed: {errors[0]}")
+        sock = self._require_socket()
+        self._apply_remaining_timeout(sock)
+        sock.send_pyobj(self._handle)
+        self._can_send = False
+        self._apply_remaining_timeout(sock)
+        ack = sock.recv()
+        self._can_send = True
+        if ack != b"":
+            error = ack.decode("utf-8", errors="replace")
+            # The worker's handshake error path waits for one raw ACK before
+            # raising and closing; it has not entered the payload state machine.
+            sock.send(b"")
+            self._can_send = False
+            raise RuntimeError(f"CkptEngineWeightSender: receiver handshake failed: {error}")
 
     def _send_bucket(self, metadata: List[Dict[str, Any]]) -> None:
-        """Send bucket metadata to every supplied receiver and collect acks."""
-        # Send to all sockets
-        for i, sock in enumerate(self.sockets):
-            self._apply_remaining_timeout(sock)
-            sock.send_pyobj(metadata)
-            self._can_send[i] = False
-        # Collect acks from all sockets
-        errors = []
-        for i, sock in enumerate(self.sockets):
-            self._apply_remaining_timeout(sock)
-            ack = sock.recv()
-            self._can_send[i] = True
-            if ack != b"":
-                errors.append(f"receiver {i}: {ack.decode('utf-8', errors='replace')}")
-        if errors:
-            raise RuntimeError(f"CkptEngineWeightSender: bucket load failed: {errors[0]}")
+        """Send bucket metadata to this rank's receiver and collect its ACK."""
+        sock = self._require_socket()
+        self._apply_remaining_timeout(sock)
+        sock.send_pyobj(metadata)
+        self._can_send = False
+        self._apply_remaining_timeout(sock)
+        ack = sock.recv()
+        self._can_send = True
+        if ack != b"":
+            error = ack.decode("utf-8", errors="replace")
+            raise RuntimeError(f"CkptEngineWeightSender: bucket load failed: {error}")
 
-    def _send_none_to_all(self) -> None:
-        """Send None to every supplied receiver and collect acks."""
-        for i, sock in enumerate(self.sockets):
-            self._apply_remaining_timeout(sock)
-            sock.send_pyobj(None)
-            self._can_send[i] = False
-        errors = []
-        for i, sock in enumerate(self.sockets):
-            self._apply_remaining_timeout(sock)
-            ack = sock.recv()
-            self._can_send[i] = True
-            if ack != b"":
-                errors.append(f"receiver {i}: {ack.decode('utf-8', errors='replace')}")
-        if errors:
-            raise RuntimeError(f"CkptEngineWeightSender: receiver finalization failed: {errors[0]}")
+    def _send_none(self) -> None:
+        """Send one lifecycle sentinel and collect the receiver's ACK."""
+        sock = self._require_socket()
+        self._apply_remaining_timeout(sock)
+        sock.send_pyobj(None)
+        self._can_send = False
+        self._apply_remaining_timeout(sock)
+        ack = sock.recv()
+        self._can_send = True
+        if ack != b"":
+            error = ack.decode("utf-8", errors="replace")
+            raise RuntimeError(f"CkptEngineWeightSender: receiver finalization failed: {error}")
 
     def _apply_remaining_timeout(self, sock: zmq.Socket) -> None:
         """Apply one absolute transfer deadline to every socket operation."""
         if self._deadline is None:
-            timeout_ms = self.timeout_ms
-        else:
-            remaining = self._deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("CkptEngineWeightSender: transfer deadline exceeded")
-            timeout_ms = max(1, int(remaining * 1000))
+            raise RuntimeError("transfer deadline is not initialized")
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("CkptEngineWeightSender: transfer deadline exceeded")
+        timeout_ms = max(1, int(remaining * 1000))
         sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
         sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
 
-    def _abort_receivers(self, error: BaseException) -> None:
-        """Release workers that entered checkpoint-engine's payload loop."""
+    def _abort_receiver(self, error: BaseException) -> None:
+        """Release the worker after it entered checkpoint-engine's payload loop."""
+        if self.socket is None:
+            return
         abort = RuntimeError(f"CkptEngineWeightSender aborted: {error}")
-        pending_ack = []
-        for i, sock in enumerate(self.sockets):
-            if not self._can_send[i]:
-                pending_ack.append(i)
-                continue
-            try:
-                # checkpoint_engine.worker raises this payload without replying.
-                sock.send_pyobj(abort)
-                self._can_send[i] = False
-                self._abort_sent = True
-            except Exception:
-                logger.exception("Failed to send checkpoint-engine abort to receiver %d", i)
-        if pending_ack:
+        if not self._can_send:
             logger.error(
-                "Cannot send checkpoint-engine abort while awaiting ACK from receivers %s; "
-                "the orchestrator must terminate SGLang",
-                pending_ack,
+                "Cannot send checkpoint-engine abort while awaiting an ACK; the orchestrator must terminate SGLang"
             )
+            return
+        try:
+            # checkpoint_engine.worker raises this payload without replying.
+            self.socket.send_pyobj(abort)
+            self._can_send = False
+            self._abort_sent = True
+        except Exception:
+            logger.exception("Failed to send checkpoint-engine abort")
 
     def close(self) -> None:
         """Release a prepared sender that did not enter ``send_weights``."""
         self._cleanup()
 
     def _cleanup(self) -> None:
-        """Close all sockets and release the buffer."""
-        for sock in self.sockets:
+        """Close the socket and release the buffer."""
+        socket = self.socket
+        self.socket = None
+        if socket is not None:
             try:
-                sock.close(linger=5000 if self._abort_sent else 0)
+                socket.close(linger=5000 if self._abort_sent else 0)
             except Exception:
                 pass
-        self.sockets = []
-        self._can_send = []
-
-        for path in self.socket_paths:
-            if path.startswith("ipc:///"):
-                ipc_path = path[len("ipc://") :]
-                try:
-                    os.remove(ipc_path)
-                except OSError:
-                    pass
+        self._can_send = False
 
         self._release_buffer()
 
