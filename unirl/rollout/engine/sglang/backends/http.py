@@ -149,6 +149,9 @@ def _launch_server_with_env(server_args: Any, env_overrides: Dict[str, str]) -> 
     return launch_server(server_args)
 
 
+# TODO(sglang-upgrade): Once the pinned release and deployment image use the
+# same io_struct representation, replace this compatibility serializer with
+# that version's native conversion API.
 def asdict_drop_none(req: Any) -> Dict[str, Any]:
     """The wire view of an io_struct request: its fields minus the ``None``s."""
     if dataclasses.is_dataclass(req) and not isinstance(req, type):
