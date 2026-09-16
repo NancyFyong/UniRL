@@ -93,7 +93,7 @@ class WeightSync:
         if not isinstance(self._backend, CheckpointEngineIPCBackend):
             raise TypeError("SGLang backend does not support checkpoint-engine IPC")
         self._backend.update_from_ipc(
-            zmq_handles=dict(zmq_handles),
+            zmq_handles=zmq_handles,
             flush_cache=flush_cache,
             timeout_s=timeout_s,
         )

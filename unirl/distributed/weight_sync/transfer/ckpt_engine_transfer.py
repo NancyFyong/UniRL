@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 import os
 import time
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -12,6 +13,7 @@ import zmq
 from torch.multiprocessing.reductions import reduce_tensor
 
 _PARAMETER_ALIGNMENT = 256
+logger = logging.getLogger(__name__)
 
 
 class CoordinatedWeightSyncError(RuntimeError):
@@ -24,9 +26,11 @@ class CkptEngineWeightSender:
     def __init__(
         self,
         zmq_handles: Dict[str, str],
-        bucket_size_mb: int = 2048,
-        timeout_s: int = 600,
+        bucket_size_mb: int,
+        timeout_s: int,
     ) -> None:
+        if not zmq_handles:
+            raise ValueError("zmq_handles must be non-empty")
         self.socket_paths = list(zmq_handles.values())
         self.bucket_size_mb = int(bucket_size_mb)
         self.bucket_size = self.bucket_size_mb << 20
@@ -82,7 +86,16 @@ class CkptEngineWeightSender:
                 except CoordinatedWeightSyncError:
                     raise
                 except BaseException as exc:
-                    self._abort_training_group()
+                    try:
+                        self._abort_training_group()
+                    except BaseException as abort_exc:
+                        raise CoordinatedWeightSyncError(
+                            "CkptEngineWeightSender: tensor materialization failed and "
+                            "the training process group could not be aborted"
+                        ) from BaseExceptionGroup(
+                            "materialization and process-group abort failures",
+                            [exc, abort_exc],
+                        )
                     raise CoordinatedWeightSyncError(
                         "CkptEngineWeightSender: tensor materialization failed; training process group aborted"
                     ) from exc
@@ -182,13 +195,31 @@ class CkptEngineWeightSender:
     @staticmethod
     def _abort_training_group() -> None:
         """Fail-stop a rank-local materialization error before peers hang."""
-        try:
-            import torch.distributed as dist
+        import torch.distributed as dist
 
-            if dist.is_initialized() and dist.group.WORLD is not None:
-                dist.group.WORLD.abort()
-        except Exception:
-            pass
+        if not dist.is_initialized() or dist.get_world_size() == 1:
+            return
+
+        failures: list[Exception] = []
+        world = dist.group.WORLD
+        try:
+            abort = getattr(world, "abort", None)
+            if not callable(abort):
+                raise RuntimeError("default ProcessGroup has no abort() capability")
+            abort()
+            return
+        except Exception as exc:
+            failures.append(exc)
+            logger.exception("ProcessGroup.abort() failed; falling back to destroy_process_group()")
+
+        try:
+            dist.destroy_process_group(world)
+        except Exception as exc:
+            failures.append(exc)
+            raise RuntimeError("failed to abort or destroy the default process group") from ExceptionGroup(
+                "process-group shutdown failures",
+                failures,
+            )
 
     @staticmethod
     def _exchange(
@@ -304,8 +335,10 @@ class CkptEngineWeightSender:
     def _abort_receivers(self, error: BaseException) -> None:
         """Release workers that entered checkpoint-engine's payload loop."""
         abort = RuntimeError(f"CkptEngineWeightSender aborted: {error}")
+        pending_ack = []
         for i, sock in enumerate(self.sockets):
             if not self._can_send[i]:
+                pending_ack.append(i)
                 continue
             try:
                 # checkpoint_engine.worker raises this payload without replying.
@@ -313,7 +346,13 @@ class CkptEngineWeightSender:
                 self._can_send[i] = False
                 self._abort_sent = True
             except Exception:
-                pass
+                logger.exception("Failed to send checkpoint-engine abort to receiver %d", i)
+        if pending_ack:
+            logger.error(
+                "Cannot send checkpoint-engine abort while awaiting ACK from receivers %s; "
+                "the orchestrator must terminate SGLang",
+                pending_ack,
+            )
 
     def close(self) -> None:
         """Release a prepared sender that did not enter ``send_weights``."""

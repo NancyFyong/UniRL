@@ -380,11 +380,9 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         *,
         zmq_handles: Dict[str, str],
         flush_cache: bool = True,
-        track_prefix: str = "",
         timeout_s: Optional[float] = None,
     ) -> None:
         """Update weights via ZMQ + CUDA IPC (checkpoint_engine protocol)."""
-        del track_prefix
         if not self._is_tp_zero:
             return
         if self._checkpoint_engine_sync_error is not None:
@@ -404,7 +402,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
 
     def mark_checkpoint_engine_sync_failed(self, error: str) -> None:
         """Poison this rollout after a possibly partial live-weight update."""
-        self._checkpoint_engine_sync_error = str(error)
+        self._checkpoint_engine_sync_error = error
 
 
 __all__ = ["SGLangRolloutEngine"]

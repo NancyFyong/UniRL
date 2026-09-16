@@ -131,7 +131,10 @@ class CkptEngineIPCWeightSync(FullWeightSync):
             server_dp = engine_kwargs.get("dp_size")
         if int(server_dp or 1) != 1:
             raise NotImplementedError("CkptEngineIPCWeightSync does not support SGLang server-level dp_size>1")
-        if any(key.startswith("speculative") for key in engine_kwargs):
+        if any(
+            key.startswith("speculative") and value not in (None, False, "", "none")
+            for key, value in engine_kwargs.items()
+        ):
             raise NotImplementedError("CkptEngineIPCWeightSync does not support SGLang speculative decoding workers")
 
     def _validate_rollout_capability(self) -> None:
@@ -174,7 +177,6 @@ class CkptEngineIPCWeightSync(FullWeightSync):
                 self._rollout.update_weights_from_checkpoint_engine_ipc(
                     zmq_handles=zmq_handles,
                     flush_cache=self._flush_cache,
-                    track_prefix=self._track_prefix,
                     timeout_s=self._timeout_s + 30,
                 )
             except Exception as exc:
@@ -188,12 +190,27 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         """Run the thread-safe HTTP receiver beside the main-thread sender."""
         recv_thread = threading.Thread(target=receive, daemon=True)
         recv_thread.start()
+        sender_error: Optional[BaseException] = None
         try:
             self._run_sender(sender)
-        finally:
-            recv_thread.join(timeout=self._timeout_s + 30)
-        if recv_thread.is_alive():
-            raise TimeoutError("CkptEngineIPCWeightSync: receiver thread did not stop")
+        except BaseException as exc:
+            sender_error = exc
+
+        # A checkpoint-engine worker has no receive timeout. If a REQ socket
+        # times out while awaiting an ACK, it cannot send the protocol's abort
+        # payload, so terminate SRT rather than leave its REP workers wedged.
+        recv_thread.join(timeout=5 if sender_error is not None else self._timeout_s + 30)
+        if sender_error is not None or recv_thread.is_alive():
+            operation_error = sender_error or TimeoutError("CkptEngineIPCWeightSync: receiver thread did not stop")
+            self._poison_rollout(operation_error)
+            try:
+                self._rollout.shutdown()
+            except Exception:
+                logger.exception("Failed to terminate SGLang after a checkpoint-engine transfer failure")
+            recv_thread.join(timeout=10)
+            if recv_thread.is_alive():
+                logger.error("Checkpoint-engine receiver thread remained alive after SGLang shutdown")
+            raise operation_error
 
     def _prepare_sender(self, zmq_handles: Dict[str, str]):
         """Allocate every rank's IPC buffer before starting any receiver."""
@@ -250,8 +267,12 @@ class CkptEngineIPCWeightSync(FullWeightSync):
 
     def _get_tp_size(self) -> int:
         """Get the SGLang engine's TP size."""
-        tp_size = getattr(self._rollout, "_tp_size", 1)
-        return int(tp_size) if tp_size else 1
+        if not hasattr(self._rollout, "_tp_size"):
+            raise TypeError("CkptEngineIPCWeightSync requires rollout._tp_size")
+        tp_size = int(self._rollout._tp_size)
+        if tp_size < 1:
+            raise ValueError(f"CkptEngineIPCWeightSync requires tp_size>=1; got {tp_size}")
+        return tp_size
 
     @staticmethod
     def _get_current_gpu_uuid() -> str:
