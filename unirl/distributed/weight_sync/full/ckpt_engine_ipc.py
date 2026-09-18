@@ -77,7 +77,7 @@ class CkptEngineIPCWeightSync(FullWeightSync):
             topology_error = exc
         self._sender_consensus(topology_error, "topology")
 
-        sender, tp_rank = self._prepare_local_sender(zmq_handles, tp_size, local_uuid)
+        sender = self._prepare_local_sender(zmq_handles, tp_size, local_uuid)
 
         operation_error: Optional[BaseException] = None
         try:
@@ -87,8 +87,8 @@ class CkptEngineIPCWeightSync(FullWeightSync):
                     "[CkptEngine-IPC] rank %s: pushed weights from local TP GPU %s (tp_rank=%s/%s)",
                     rank,
                     local_uuid,
-                    tp_rank,
-                    ri.tp_size if ri else 1,
+                    ri.tp_rank,
+                    ri.tp_size,
                 )
             else:
                 logger.info(
@@ -123,12 +123,10 @@ class CkptEngineIPCWeightSync(FullWeightSync):
                 f"CkptEngineIPCWeightSync: RankInfo tp_size={ri.tp_size} does not match "
                 f"the colocated rollout tp_size={tp_size}."
             )
-        cfg = getattr(self._rollout, "cfg", None)
-        engine_kwargs = dict(getattr(cfg, "engine_kwargs", None) or {})
-        server_dp = getattr(cfg, "dp_size", None)
-        if server_dp is None:
-            server_dp = engine_kwargs.get("dp_size")
-        if int(1 if server_dp is None else server_dp) != 1:
+        cfg = self._rollout.cfg
+        engine_kwargs = cfg.engine_kwargs
+        server_dp = cfg.dp_size if cfg.dp_size is not None else engine_kwargs.get("dp_size", 1)
+        if server_dp != 1:
             raise NotImplementedError("CkptEngineIPCWeightSync does not support SGLang server-level dp_size>1")
         if any(
             key.startswith("speculative") and value not in (None, False, "", "none")
@@ -168,7 +166,7 @@ class CkptEngineIPCWeightSync(FullWeightSync):
                 f"uuid={local_uuid!r}, tp_rank={tp_rank}, tp_size={tp_size}, "
                 f"available_uuids={sorted(zmq_handles)!r}"
             )
-        return self._prepare_sender(local_path), tp_rank
+        return self._prepare_sender(local_path)
 
     def _run_exchange(self, sender, zmq_handles: Dict[str, str]) -> None:
         """Run the HTTP receiver beside the main-thread sender."""
@@ -251,12 +249,12 @@ class CkptEngineIPCWeightSync(FullWeightSync):
 
         phase_id = zlib.crc32(phase.encode("utf-8"))
         state = torch.tensor(
-            [phase_id, -phase_id, int(error is None)],
+            [phase_id, -phase_id, error is None],
             dtype=torch.int64,
             device=f"cuda:{torch.cuda.current_device()}",
         )
         dist.all_reduce(state, op=dist.ReduceOp.MIN)
-        min_phase, neg_max_phase, all_succeeded = (int(value) for value in state.cpu().tolist())
+        min_phase, neg_max_phase, all_succeeded = state.cpu().tolist()
 
         if min_phase != -neg_max_phase:
             raise CoordinatedWeightSyncError(
@@ -268,8 +266,6 @@ class CkptEngineIPCWeightSync(FullWeightSync):
 
     def _get_tp_size(self) -> int:
         """Get the SGLang engine's TP size."""
-        if not hasattr(self._rollout, "_tp_size"):
-            raise TypeError("CkptEngineIPCWeightSync requires rollout._tp_size")
         tp_size = self._rollout._tp_size
         if tp_size < 1:
             raise ValueError(f"CkptEngineIPCWeightSync requires tp_size>=1; got {tp_size}")

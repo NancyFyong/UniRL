@@ -28,16 +28,12 @@ class CkptEngineWeightSender:
         bucket_size_mb: int,
         timeout_s: int,
     ) -> None:
-        if not socket_path:
-            raise ValueError("socket_path must be non-empty")
         self.socket_path = socket_path
         self.bucket_size_mb = bucket_size_mb
         self.bucket_size = self.bucket_size_mb << 20
         self.timeout_ms = timeout_s * 1000
         if self.bucket_size <= 0:
             raise ValueError(f"bucket_size_mb must be positive; got {bucket_size_mb}")
-        if self.timeout_ms <= 0:
-            raise ValueError(f"timeout_s must be positive; got {timeout_s}")
 
         self.zmq_context = zmq.Context.instance()
         self.socket: Optional[zmq.Socket] = None
@@ -322,7 +318,7 @@ class CkptEngineWeightSender:
             try:
                 socket.close(linger=5000 if self._abort_sent else 0)
             except Exception:
-                pass
+                logger.exception("Failed to close checkpoint-engine sender socket")
         self._can_send = False
 
         self._release_buffer()
