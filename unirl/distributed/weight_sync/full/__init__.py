@@ -5,9 +5,4 @@ from unirl.distributed.weight_sync.full.ipc import IPCWeightSync
 from unirl.distributed.weight_sync.full.nccl import NCCLWeightSync
 from unirl.distributed.weight_sync.full.tensor import TensorWeightSync
 
-__all__ = [
-    "FullWeightSync",
-    "NCCLWeightSync",
-    "TensorWeightSync",
-    "IPCWeightSync",
-]
+__all__ = ["FullWeightSync", "NCCLWeightSync", "TensorWeightSync", "IPCWeightSync"]

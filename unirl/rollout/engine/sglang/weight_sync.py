@@ -84,8 +84,8 @@ class WeightSync:
         self,
         *,
         zmq_handles: Dict[str, str],
-        flush_cache: bool = True,
-        timeout_s: Optional[float] = None,
+        flush_cache: bool,
+        timeout_s: float,
     ) -> None:
         """Push full weights via ZMQ + CUDA IPC (checkpoint-engine protocol)."""
         if not zmq_handles:

@@ -33,7 +33,6 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         lora_merged: bool = False,
         adapter_name: Optional[str] = None,
         name_remap: Optional[Dict[str, Optional[str]]] = None,
-        track_prefix: str = "",
         wire_dtype: Any = None,
         timeout_s: int = 600,
     ) -> None:
@@ -44,7 +43,6 @@ class CkptEngineIPCWeightSync(FullWeightSync):
             lora_merged=lora_merged,
             adapter_name=adapter_name,
             name_remap=name_remap,
-            track_prefix=track_prefix,
             wire_dtype=wire_dtype,
         )
         self._rollout = rollout
@@ -120,7 +118,7 @@ class CkptEngineIPCWeightSync(FullWeightSync):
                 "CkptEngineIPCWeightSync: rollout pp_size>1 is not implemented; "
                 "stage-local socket routing and parameter filtering are required."
             )
-        if ri is not None and int(ri.tp_size) != tp_size:
+        if ri is not None and ri.tp_size != tp_size:
             raise RuntimeError(
                 f"CkptEngineIPCWeightSync: RankInfo tp_size={ri.tp_size} does not match "
                 f"the colocated rollout tp_size={tp_size}."
@@ -162,7 +160,7 @@ class CkptEngineIPCWeightSync(FullWeightSync):
     ):
         """Select this TP rank's colocated endpoint and allocate its sender."""
         ri = self.rank_info
-        tp_rank = int(ri.tp_rank) if ri is not None else 0
+        tp_rank = ri.tp_rank if ri is not None else 0
         local_path = zmq_handles.get(local_uuid)
         if local_path is None:
             raise RuntimeError(
@@ -272,7 +270,7 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         """Get the SGLang engine's TP size."""
         if not hasattr(self._rollout, "_tp_size"):
             raise TypeError("CkptEngineIPCWeightSync requires rollout._tp_size")
-        tp_size = int(self._rollout._tp_size)
+        tp_size = self._rollout._tp_size
         if tp_size < 1:
             raise ValueError(f"CkptEngineIPCWeightSync requires tp_size>=1; got {tp_size}")
         return tp_size
@@ -300,9 +298,9 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         local_endpoint = self._new_zmq_endpoint()
         if ri is not None and dist.is_initialized() and dist.get_world_size() > 1:
             local = {
-                "dp_rank": int(ri.dp_rank),
-                "pp_rank": int(ri.pp_rank),
-                "tp_rank": int(ri.tp_rank),
+                "dp_rank": ri.dp_rank,
+                "pp_rank": ri.pp_rank,
+                "tp_rank": ri.tp_rank,
                 "host": socket.gethostname(),
                 "uuid": local_uuid,
                 "endpoint": local_endpoint,

@@ -379,8 +379,8 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         self,
         *,
         zmq_handles: Dict[str, str],
-        flush_cache: bool = True,
-        timeout_s: Optional[float] = None,
+        flush_cache: bool,
+        timeout_s: float,
     ) -> None:
         """Update weights via ZMQ + CUDA IPC (checkpoint_engine protocol)."""
         if not self._is_tp_zero:

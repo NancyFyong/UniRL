@@ -569,8 +569,8 @@ class HTTPBackend:
         self,
         *,
         zmq_handles: Dict[str, str],
-        flush_cache: bool = True,
-        timeout_s: Optional[float] = None,
+        flush_cache: bool,
+        timeout_s: float,
     ) -> None:
         self._post_struct(
             "/update_weights_from_ipc",
@@ -579,7 +579,7 @@ class HTTPBackend:
                 flush_cache=flush_cache,
             ),
             "update_from_checkpoint_engine_ipc",
-            timeout=_TIERED_TIMEOUT if timeout_s is None else float(timeout_s),
+            timeout=timeout_s,
         )
 
     def set_lora(

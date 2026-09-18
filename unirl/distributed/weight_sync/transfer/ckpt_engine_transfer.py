@@ -31,9 +31,9 @@ class CkptEngineWeightSender:
         if not socket_path:
             raise ValueError("socket_path must be non-empty")
         self.socket_path = socket_path
-        self.bucket_size_mb = int(bucket_size_mb)
+        self.bucket_size_mb = bucket_size_mb
         self.bucket_size = self.bucket_size_mb << 20
-        self.timeout_ms = int(timeout_s) * 1000
+        self.timeout_ms = timeout_s * 1000
         if self.bucket_size <= 0:
             raise ValueError(f"bucket_size_mb must be positive; got {bucket_size_mb}")
         if self.timeout_ms <= 0:
@@ -50,7 +50,7 @@ class CkptEngineWeightSender:
     def prepare(self) -> None:
         """Allocate the CUDA IPC buffer; sockets are created later on the sender thread."""
         if self.buffer is not None or self._handle is not None:
-            raise RuntimeError("CkptEngineWeightSender.prepare() may only be called once")
+            raise RuntimeError("CkptEngineWeightSender is already prepared")
         self._allocate_buffer()
 
     def send_weights(
@@ -65,8 +65,6 @@ class CkptEngineWeightSender:
                 raise RuntimeError("CkptEngineWeightSender.prepare() must succeed before send_weights()")
             # Create/bind sockets in THIS thread (see ``prepare`` docstring):
             # pyzmq sockets must live and die on the thread that uses them.
-            if self.socket is not None:
-                raise RuntimeError("CkptEngineWeightSender.send_weights() may only be called once")
             self._init_socket()
             self._exchange(self._handshake, consensus, "handshake")
 
@@ -74,18 +72,15 @@ class CkptEngineWeightSender:
             bucket_index = 0
             bucket_meta: List[Dict[str, Any]] = []
             tensor_index = 0
-            weights_iter = iter(weights)
 
             while True:
                 item = None
                 exhausted = False
                 stage_error: Optional[BaseException] = None
                 try:
-                    item = next(weights_iter)
+                    item = next(weights)
                 except StopIteration:
                     exhausted = True
-                except CoordinatedWeightSyncError:
-                    raise
                 except BaseException as exc:
                     try:
                         self._abort_training_group()
@@ -111,7 +106,7 @@ class CkptEngineWeightSender:
                         if aligned_offset + weight_nbytes > self.bucket_size and bucket_meta:
                             torch.cuda.current_stream().synchronize()
                             self._exchange(
-                                lambda: self._send_bucket(bucket_meta),
+                                lambda: self._send_payload(bucket_meta, "bucket load"),
                                 consensus,
                                 f"bucket-{bucket_index}",
                             )
@@ -162,16 +157,24 @@ class CkptEngineWeightSender:
             if bucket_meta:
                 torch.cuda.current_stream().synchronize()
                 self._exchange(
-                    lambda: self._send_bucket(bucket_meta),
+                    lambda: self._send_payload(bucket_meta, "bucket load"),
                     consensus,
                     f"bucket-{bucket_index}",
                 )
 
             # Match checkpoint-engine's lifecycle: release both sides of the IPC
             # allocation before running a potentially memory-heavy post-hook.
-            self._exchange(self._send_none, consensus, "release")
+            self._exchange(
+                lambda: self._send_payload(None, "receiver finalization"),
+                consensus,
+                "release",
+            )
             self._release_buffer()
-            self._exchange(self._send_none, consensus, "post-hook")
+            self._exchange(
+                lambda: self._send_payload(None, "receiver finalization"),
+                consensus,
+                "post-hook",
+            )
 
         except BaseException as exc:
             self._abort_receiver(exc)
@@ -239,7 +242,7 @@ class CkptEngineWeightSender:
 
     def _allocate_buffer(self) -> None:
         """Allocate and export the reusable CUDA buffer."""
-        # _send_bucket waits for every receiver's ACK before this buffer is reused,
+        # Every payload waits for its receiver ACK before this buffer is reused,
         # so a second half cannot overlap useful work and only increases peak VRAM.
         self.buffer = torch.empty(
             self.bucket_size,
@@ -265,31 +268,18 @@ class CkptEngineWeightSender:
             self._can_send = False
             raise RuntimeError(f"CkptEngineWeightSender: receiver handshake failed: {error}")
 
-    def _send_bucket(self, metadata: List[Dict[str, Any]]) -> None:
-        """Send bucket metadata to this rank's receiver and collect its ACK."""
+    def _send_payload(self, payload: Any, operation: str) -> None:
+        """Send one protocol payload and collect the receiver's ACK."""
         sock = self._require_socket()
         self._apply_remaining_timeout(sock)
-        sock.send_pyobj(metadata)
+        sock.send_pyobj(payload)
         self._can_send = False
         self._apply_remaining_timeout(sock)
         ack = sock.recv()
         self._can_send = True
         if ack != b"":
             error = ack.decode("utf-8", errors="replace")
-            raise RuntimeError(f"CkptEngineWeightSender: bucket load failed: {error}")
-
-    def _send_none(self) -> None:
-        """Send one lifecycle sentinel and collect the receiver's ACK."""
-        sock = self._require_socket()
-        self._apply_remaining_timeout(sock)
-        sock.send_pyobj(None)
-        self._can_send = False
-        self._apply_remaining_timeout(sock)
-        ack = sock.recv()
-        self._can_send = True
-        if ack != b"":
-            error = ack.decode("utf-8", errors="replace")
-            raise RuntimeError(f"CkptEngineWeightSender: receiver finalization failed: {error}")
+            raise RuntimeError(f"CkptEngineWeightSender: {operation} failed: {error}")
 
     def _apply_remaining_timeout(self, sock: zmq.Socket) -> None:
         """Apply one absolute transfer deadline to every socket operation."""
