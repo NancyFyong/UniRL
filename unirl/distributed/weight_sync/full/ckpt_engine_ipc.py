@@ -81,30 +81,33 @@ class CkptEngineIPCWeightSync(FullWeightSync):
 
         sender = self._prepare_sender(zmq_handles, tp_size, local_uuid)
 
-        operation_error: Optional[BaseException] = None
         try:
-            if not is_tp_zero:
-                self._run_sender(sender)
-                logger.debug(
-                    "[CkptEngine-IPC] rank %s: pushed weights from local TP GPU %s (tp_rank=%s/%s)",
-                    rank,
-                    local_uuid,
-                    ri.tp_rank,
-                    ri.tp_size,
-                )
-            else:
-                logger.info(
-                    "[CkptEngine-IPC] rank %s: pushing full weights to %d TP rank(s) via checkpoint_engine IPC",
-                    rank,
-                    tp_size,
-                )
-                self._run_exchange(sender, zmq_handles)
-                logger.info("[CkptEngine-IPC] rank %s: full weight sync completed", rank)
-        except CoordinatedWeightSyncError as exc:
-            self._poison_rollout(exc)
-            raise
-        except BaseException as exc:
-            operation_error = exc
+            operation_error: Optional[BaseException] = None
+            try:
+                if not is_tp_zero:
+                    self._run_sender(sender)
+                    logger.debug(
+                        "[CkptEngine-IPC] rank %s: pushed weights from local TP GPU %s (tp_rank=%s/%s)",
+                        rank,
+                        local_uuid,
+                        ri.tp_rank,
+                        ri.tp_size,
+                    )
+                else:
+                    logger.info(
+                        "[CkptEngine-IPC] rank %s: pushing full weights to %d TP rank(s) via checkpoint_engine IPC",
+                        rank,
+                        tp_size,
+                    )
+                    self._run_exchange(sender, zmq_handles)
+                    logger.info("[CkptEngine-IPC] rank %s: full weight sync completed", rank)
+            except CoordinatedWeightSyncError as exc:
+                self._poison_rollout(exc)
+                raise
+            except BaseException as exc:
+                operation_error = exc
+        finally:
+            sender.close()
 
         try:
             self._sender_consensus(operation_error, "complete")
@@ -131,7 +134,7 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         if server_dp != 1:
             raise NotImplementedError("CkptEngineIPCWeightSync does not support SGLang server-level dp_size>1")
         if any(
-            key.startswith("speculative") and value not in (None, False, "", "none")
+            key.startswith("speculative") and value and (not isinstance(value, str) or value.strip().lower() != "none")
             for key, value in engine_kwargs.items()
         ):
             raise NotImplementedError("CkptEngineIPCWeightSync does not support SGLang speculative decoding workers")
@@ -159,22 +162,23 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         local_uuid: str,
     ):
         """Select this TP rank's colocated endpoint and allocate its sender."""
-        ri = self.rank_info
-        tp_rank = ri.tp_rank if ri is not None else 0
-        local_path = zmq_handles.get(local_uuid)
-        if local_path is None:
-            raise RuntimeError(
-                "CkptEngineIPCWeightSync: the current GPU has no matching IPC endpoint; "
-                f"uuid={local_uuid!r}, tp_rank={tp_rank}, tp_size={tp_size}, "
-                f"available_uuids={sorted(zmq_handles)!r}"
-            )
-        sender = CkptEngineWeightSender(
-            socket_path=local_path,
-            bucket_size_mb=self._bucket_bytes // (1024 * 1024),
-            timeout_s=self._timeout_s,
-        )
+        sender = None
         prepare_error = None
         try:
+            ri = self.rank_info
+            tp_rank = ri.tp_rank if ri is not None else 0
+            local_path = zmq_handles.get(local_uuid)
+            if local_path is None:
+                raise RuntimeError(
+                    "CkptEngineIPCWeightSync: the current GPU has no matching IPC endpoint; "
+                    f"uuid={local_uuid!r}, tp_rank={tp_rank}, tp_size={tp_size}, "
+                    f"available_uuids={sorted(zmq_handles)!r}"
+                )
+            sender = CkptEngineWeightSender(
+                socket_path=local_path,
+                bucket_size_mb=self._bucket_bytes // (1024 * 1024),
+                timeout_s=self._timeout_s,
+            )
             sender.prepare()
         except BaseException as exc:
             prepare_error = exc
@@ -182,7 +186,8 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         try:
             self._sender_consensus(prepare_error, "prepare")
         except BaseException:
-            sender.close()
+            if sender is not None:
+                sender.close()
             raise
         return sender
 
@@ -212,7 +217,7 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         # A checkpoint-engine worker has no receive timeout. If a REQ socket
         # times out while awaiting an ACK, it cannot send the protocol's abort
         # payload, so terminate SRT rather than leave its REP workers wedged.
-        recv_thread.join(timeout=5 if sender_error is not None else self._timeout_s + _RECEIVER_TIMEOUT_GRACE_S)
+        recv_thread.join(timeout=5 if sender_error is not None else _RECEIVER_TIMEOUT_GRACE_S)
         if sender_error is not None or recv_thread.is_alive():
             operation_error = sender_error or TimeoutError("CkptEngineIPCWeightSync: receiver thread did not stop")
             try:
@@ -242,13 +247,16 @@ class CkptEngineIPCWeightSync(FullWeightSync):
             return
 
         phase_id = zlib.crc32(phase.encode("utf-8"))
-        state = torch.tensor(
-            [phase_id, -phase_id, error is None],
-            dtype=torch.int64,
-            device=f"cuda:{torch.cuda.current_device()}",
-        )
-        dist.all_reduce(state, op=dist.ReduceOp.MIN)
-        min_phase, neg_max_phase, all_succeeded = state.cpu().tolist()
+        try:
+            state = torch.tensor(
+                [phase_id, -phase_id, error is None],
+                dtype=torch.int64,
+                device=f"cuda:{torch.cuda.current_device()}",
+            )
+            dist.all_reduce(state, op=dist.ReduceOp.MIN)
+            min_phase, neg_max_phase, all_succeeded = state.cpu().tolist()
+        except BaseException as exc:
+            raise CoordinatedWeightSyncError(f"CkptEngineIPCWeightSync consensus failed during {phase}") from exc
 
         if min_phase != -neg_max_phase:
             raise CoordinatedWeightSyncError(
@@ -263,8 +271,8 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         """Return the UUID of this Ray worker's CUDA device."""
         import torch
 
-        uuid = str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
-        return uuid if uuid.startswith("GPU-") else f"GPU-{uuid}"
+        uuid = torch.cuda.get_device_properties(torch.cuda.current_device()).uuid
+        return f"GPU-{uuid!s}"
 
     def _build_zmq_handles(self, tp_size: int, local_uuid: str) -> Dict[str, str]:
         """Build ``{device_uuid: zmq_socket_path}`` for this TP group."""

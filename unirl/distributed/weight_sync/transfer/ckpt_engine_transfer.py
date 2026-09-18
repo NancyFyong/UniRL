@@ -40,11 +40,11 @@ class CkptEngineWeightSender:
         self._can_send = False
         self.buffer = None
         self._handle = None
-        self._abort_sent = False
+        self._needs_linger = False
         self._deadline: Optional[float] = None
 
     def prepare(self) -> None:
-        """Allocate the CUDA IPC buffer; sockets are created later on the sender thread."""
+        """Allocate the CUDA IPC buffer; the socket is bound after prepare consensus."""
         if self.buffer is not None or self._handle is not None:
             raise RuntimeError("CkptEngineWeightSender is already prepared")
         # Every payload waits for its receiver ACK before this buffer is reused,
@@ -61,14 +61,14 @@ class CkptEngineWeightSender:
         weights: Iterator[Tuple[str, "object"]],
         consensus: Callable[[Optional[BaseException], str], None],
     ) -> None:
-        """Send ``(name, tensor)`` pairs to every supplied receiver."""
+        """Send ``(name, tensor)`` pairs to this rank's receiver."""
         try:
             self._deadline = time.monotonic() + self.timeout_ms / 1000
             if self.buffer is None or self._handle is None:
                 raise RuntimeError("CkptEngineWeightSender.prepare() must succeed before send_weights()")
-            # Create/bind sockets in THIS thread (see ``prepare`` docstring):
-            # pyzmq sockets must live and die on the thread that uses them.
-            self._init_socket()
+            # Bind only after every rank has prepared its CUDA buffer. The
+            # socket remains owned by this sender thread through cleanup.
+            self._exchange(self._init_socket, consensus, "socket-init")
             self._exchange(self._handshake, consensus, "handshake")
 
             offset = 0
@@ -146,8 +146,6 @@ class CkptEngineWeightSender:
                 # until every rank has staged this tensor or observed exhaustion.
                 phase = f"tensor-{tensor_index}-done" if exhausted else f"tensor-{tensor_index}-staged"
                 consensus(stage_error, phase)
-                if stage_error is not None:
-                    raise stage_error
                 if exhausted:
                     break
 
@@ -186,7 +184,9 @@ class CkptEngineWeightSender:
             close = getattr(weights, "close", None)
             if callable(close):
                 close()
+            item = None
             weight = None
+            payload = None
             self._cleanup()
 
     @staticmethod
@@ -202,11 +202,7 @@ class CkptEngineWeightSender:
         if not dist.is_initialized() or dist.get_world_size() == 1:
             return
 
-        world = dist.group.WORLD
-        abort = getattr(world, "abort", None)
-        if not callable(abort):
-            raise RuntimeError("default ProcessGroup has no abort() capability")
-        abort()
+        dist.group.WORLD.abort()
 
     @staticmethod
     def _exchange(
@@ -214,21 +210,18 @@ class CkptEngineWeightSender:
         consensus: Callable[[Optional[BaseException], str], None],
         phase: str,
     ) -> None:
+        """Run one operation, then let consensus propagate any rank's error."""
         error = None
         try:
             operation()
         except BaseException as exc:
             error = exc
         consensus(error, phase)
-        if error is not None:
-            raise error
 
     def _init_socket(self) -> None:
         """Bind this rank's REQ socket."""
         sock = self.zmq_context.socket(zmq.REQ)
         try:
-            sock.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
-            sock.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
             sock.setsockopt(zmq.LINGER, 0)
             sock.bind(self.socket_path)
         except BaseException:
@@ -244,7 +237,7 @@ class CkptEngineWeightSender:
         return self.socket
 
     def _handshake(self) -> None:
-        """Send the prepared IPC handle to every receiver."""
+        """Send the prepared IPC handle to this rank's receiver."""
         sock = self._require_socket()
         self._apply_remaining_timeout(sock)
         sock.send_pyobj(self._handle)
@@ -258,6 +251,7 @@ class CkptEngineWeightSender:
             # raising and closing; it has not entered the payload state machine.
             sock.send(b"")
             self._can_send = False
+            self._needs_linger = True
             raise RuntimeError(f"CkptEngineWeightSender: receiver handshake failed: {error}")
 
     def _send_payload(self, payload: Any, operation: str) -> None:
@@ -298,7 +292,7 @@ class CkptEngineWeightSender:
             # checkpoint_engine.worker raises this payload without replying.
             self.socket.send_pyobj(abort)
             self._can_send = False
-            self._abort_sent = True
+            self._needs_linger = True
         except Exception:
             logger.exception("Failed to send checkpoint-engine abort")
 
@@ -312,7 +306,7 @@ class CkptEngineWeightSender:
         self.socket = None
         if socket is not None:
             try:
-                socket.close(linger=5000 if self._abort_sent else 0)
+                socket.close(linger=5000 if self._needs_linger else 0)
             except Exception:
                 logger.exception("Failed to close checkpoint-engine sender socket")
         self._can_send = False

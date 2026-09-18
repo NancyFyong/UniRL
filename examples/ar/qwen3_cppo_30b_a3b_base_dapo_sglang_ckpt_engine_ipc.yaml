@@ -14,7 +14,6 @@ sync:
   # Qwen3-30B's bf16 embedding is about 594 MiB and one tensor cannot span
   # checkpoint-engine buckets.
   bucket_size_mb: 640
-  timeout_s: 600
 
 logging:
   run_name: cppo_qwen3-30b-a3b-base_dapo_sglang_ckpt_engine_ipc
