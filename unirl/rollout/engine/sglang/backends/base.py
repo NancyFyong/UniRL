@@ -73,7 +73,7 @@ class RawResult(Protocol):
 class CheckpointEngineIPCBackend(Protocol):
     """Optional SGLang backend capability for checkpoint-engine IPC."""
 
-    def update_from_ipc(
+    def update_from_checkpoint_engine_ipc(
         self,
         *,
         zmq_handles: Dict[str, str],

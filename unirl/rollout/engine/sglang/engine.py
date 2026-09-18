@@ -390,7 +390,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
                 "SGLang rollout cannot retry checkpoint-engine IPC after a failed update; restart the rollout backend"
             )
         try:
-            self._weight_sync.update_weights_from_ipc(
+            self._weight_sync.update_weights_from_checkpoint_engine_ipc(
                 zmq_handles=zmq_handles,
                 flush_cache=flush_cache,
                 timeout_s=timeout_s,

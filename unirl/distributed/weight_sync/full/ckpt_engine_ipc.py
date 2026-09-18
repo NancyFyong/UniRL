@@ -151,7 +151,7 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         ri = self.rank_info
         if ri is None or ri.tp_rank == 0:
             backend = getattr(self._rollout, "_backend", None)
-            if backend is None or not callable(getattr(backend, "update_from_ipc", None)):
+            if backend is None or not callable(getattr(backend, "update_from_checkpoint_engine_ipc", None)):
                 raise TypeError("CkptEngineIPCWeightSync currently supports only the SGLang HTTP backend")
 
     def _prepare_local_sender(

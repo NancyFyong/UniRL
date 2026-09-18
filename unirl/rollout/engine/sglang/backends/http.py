@@ -565,7 +565,7 @@ class HTTPBackend:
             "destroy_weights_group",
         )
 
-    def update_from_ipc(
+    def update_from_checkpoint_engine_ipc(
         self,
         *,
         zmq_handles: Dict[str, str],
@@ -578,7 +578,7 @@ class HTTPBackend:
                 zmq_handles=zmq_handles,
                 flush_cache=flush_cache,
             ),
-            "update_from_ipc",
+            "update_from_checkpoint_engine_ipc",
             timeout=_TIERED_TIMEOUT if timeout_s is None else float(timeout_s),
         )
 
