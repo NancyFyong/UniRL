@@ -47,7 +47,14 @@ class CkptEngineWeightSender:
         """Allocate the CUDA IPC buffer; sockets are created later on the sender thread."""
         if self.buffer is not None or self._handle is not None:
             raise RuntimeError("CkptEngineWeightSender is already prepared")
-        self._allocate_buffer()
+        # Every payload waits for its receiver ACK before this buffer is reused,
+        # so a second half cannot overlap useful work and only increases peak VRAM.
+        self.buffer = torch.empty(
+            self.bucket_size,
+            dtype=torch.uint8,
+            device=f"cuda:{torch.cuda.current_device()}",
+        )
+        self._handle = reduce_tensor(self.buffer)
 
     def send_weights(
         self,
@@ -235,17 +242,6 @@ class CkptEngineWeightSender:
         if self.socket is None:
             raise RuntimeError("checkpoint-engine sender socket is not initialized")
         return self.socket
-
-    def _allocate_buffer(self) -> None:
-        """Allocate and export the reusable CUDA buffer."""
-        # Every payload waits for its receiver ACK before this buffer is reused,
-        # so a second half cannot overlap useful work and only increases peak VRAM.
-        self.buffer = torch.empty(
-            self.bucket_size,
-            dtype=torch.uint8,
-            device=f"cuda:{torch.cuda.current_device()}",
-        )
-        self._handle = reduce_tensor(self.buffer)
 
     def _handshake(self) -> None:
         """Send the prepared IPC handle to every receiver."""
